@@ -9,6 +9,7 @@ import { boundProxyUrl } from '../../src/lib/vm/egress.mjs'
 import { resolveImportProxy } from '../../src/lib/vm/proxy-resolve.mjs'
 import { evaluateSlotGate } from '../../src/lib/pool/schedule-eligibility.mjs'
 import { isCodexSlotReady, pickCodexSlots } from '../../src/lib/pool/codex-slot-pool.mjs'
+import { configuredIpv6Enabled } from '../../src/lib/vm/proxy-policy.mjs'
 
 function makePool(t) {
   const pool = new ProxyPool({ db: openDatabase({ dbPath: ':memory:' }) })
@@ -39,6 +40,15 @@ test('IPv6 aliases normalize and deduplicate after loading bracketed historical 
   assert.equal(result.added, 0)
   assert.equal(result.skip_details[0].reason, 'duplicate')
   assert.equal(socksProxyUrl(parseSocks5Fields({ host: '[::1]', port: '1080' })), 'socks5h://[::1]:1080')
+})
+
+test('IPv6 policy cache is invalidated immediately by pool config updates', (t) => {
+  const pool = makePool(t)
+  assert.equal(configuredIpv6Enabled(), false)
+  pool.updateConfig({ ipv6_enabled: true })
+  assert.equal(configuredIpv6Enabled(), true)
+  pool.updateConfig({ ipv6_enabled: false })
+  assert.equal(configuredIpv6Enabled(), false)
 })
 
 test('bracketed IPv6 input works without changing hostname vendor credentials', () => {

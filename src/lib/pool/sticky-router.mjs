@@ -4,7 +4,7 @@
  */
 
 import crypto from 'node:crypto'
-import { ENVELOPE_NEEDLES, extractPrompt } from '../core/distill-detect.mjs'
+import { ENVELOPE_NEEDLES } from '../core/distill-detect.mjs'
 import { resolveStoreDb } from '../db/database.mjs'
 import { StickyRepo } from '../db/repos/sticky-repo.mjs'
 import {
@@ -79,8 +79,35 @@ export function clientIp(req) {
 }
 
 export function isPersistableEnvelope(body = {}, inbound = null) {
-  const hay = extractPrompt(inbound || body, body).joined.toLowerCase()
-  return ENVELOPE_NEEDLES.some((item) => hay.includes(String(item).toLowerCase()))
+  const needles = ENVELOPE_NEEDLES.map((item) => String(item).toLowerCase())
+  const stack = [inbound || body, body]
+  const seen = new WeakSet()
+  while (stack.length) {
+    const value = stack.pop()
+    if (typeof value === 'string') {
+      if (needles.some((needle) => value.toLowerCase().includes(needle))) return true
+      continue
+    }
+    if (!value || typeof value !== 'object' || seen.has(value)) continue
+    seen.add(value)
+    if (Array.isArray(value)) stack.push(...value)
+    else stack.push(...Object.values(value))
+  }
+  return false
+}
+
+function normalizedTextPrefix(value, limit = 4000) {
+  const source = String(value || '')
+  const words = []
+  let length = 0
+  for (const match of source.matchAll(/\S+/g)) {
+    const room = limit - length - (words.length ? 1 : 0)
+    if (room <= 0) break
+    words.push(match[0].slice(0, room))
+    length += Math.min(match[0].length, room) + (words.length > 1 ? 1 : 0)
+    if (length >= limit) break
+  }
+  return words.join(' ')
 }
 
 /** One block of the first user message, chosen by firstUserIdentityText: the
@@ -107,10 +134,7 @@ export function firstUserFingerprint(body = {}) {
   } else if (typeof body?.prompt === 'string') {
     text = body.prompt
   }
-  text = String(text || '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 4000)
+  text = normalizedTextPrefix(text)
   if (!text) return ''
   return crypto.createHash('sha256').update(text).digest('hex').slice(0, 24)
 }
@@ -155,6 +179,10 @@ export function isParentSessionCompanion(body = {}) {
 }
 
 export const SHORT_PROBE_MAX_CHARS = 64
+
+export const DEFAULT_STICKY_CACHE_MAX_ENTRIES = 8192
+export const DEFAULT_STICKY_CACHE_POSITIVE_TTL_MS = 10_000
+export const DEFAULT_STICKY_CACHE_NEGATIVE_TTL_MS = 500
 
 /**
  * One-shot test calls: sub2api account test, new-api channel test, verify
@@ -202,20 +230,55 @@ export function childDeclaredWithoutParent(body = {}, headers = {}) {
 }
 
 export class StickyRouter {
-  constructor({ dataDir, db, config }) {
+  constructor({ dataDir, db, config, cache = {} }) {
     this.db = resolveStoreDb({ db, dataDir })
     this.repo = new StickyRepo(this.db)
     this.config = mergeStickyConfig(config)
+    this.cache = new Map()
+    this.cacheMaxEntries = Math.max(0, Number(cache.maxEntries ?? DEFAULT_STICKY_CACHE_MAX_ENTRIES) || 0)
+    this.cachePositiveTtlMs = Math.max(0, Number(cache.positiveTtlMs ?? DEFAULT_STICKY_CACHE_POSITIVE_TTL_MS) || 0)
+    this.cacheNegativeTtlMs = Math.max(0, Number(cache.negativeTtlMs ?? DEFAULT_STICKY_CACHE_NEGATIVE_TTL_MS) || 0)
     this.repo.dropAliasKeys()
   }
 
   /** Kept for API compat + post-restore hook (state lives in DB). */
-  reload() {}
+  reload() {
+    this.cache.clear()
+  }
 
   /** Re-bind to a fresh DB connection (after backup restore). */
   rebind(db) {
     this.db = db
     this.repo = new StickyRepo(db)
+    this.cache.clear()
+  }
+
+  _cacheEntry(key, value, now = Date.now()) {
+    const ttl = value ? this.cachePositiveTtlMs : this.cacheNegativeTtlMs
+    if (!this.cacheMaxEntries || !ttl) return
+    this.cache.delete(key)
+    this.cache.set(key, { value, cacheUntil: now + ttl })
+    while (this.cache.size > this.cacheMaxEntries) this.cache.delete(this.cache.keys().next().value)
+  }
+
+  _readEntry(key, now = Date.now()) {
+    const cached = this.cache.get(key)
+    if (cached) {
+      if (now <= cached.cacheUntil && (!cached.value || now <= cached.value.expires_at)) {
+        this.cache.delete(key)
+        this.cache.set(key, cached)
+        return cached.value
+      }
+      this.cache.delete(key)
+    }
+    const value = this.repo.get(key)
+    this._cacheEntry(key, value, now)
+    return value
+  }
+
+  _writeEntry(key, value) {
+    this.repo.upsert(key, value)
+    this._cacheEntry(key, value)
   }
 
   isolateKey(raw, req = null) {
@@ -378,6 +441,15 @@ export class StickyRouter {
     return id ? `family2:${id}` : null
   }
 
+  /** Responses state lives on the account/VM that created it. Keep this key
+   * tenant- and platform-scoped so an opaque response id cannot cross API keys.
+   */
+  responseKey(req, responseId, platform = 'openai') {
+    const id = String(responseId || '').trim()
+    if (!id || !this.config.enabled) return null
+    return scopeStickyKey(this.isolateKey(`resp:${id}`, req), platform)
+  }
+
   /**
    * Anthropic session sticky keys. A trusted inbound session_id maps to one
    * canonical key across API keys; a still-live legacy API-key-scoped row is
@@ -425,11 +497,12 @@ export class StickyRouter {
   /** @returns {{ accountId: string, vmId: string } | null } */
   resolve(key) {
     if (!key || !this.config.enabled) return null
-    this._purge()
-    const ent = this.repo.get(key)
+    const now = Date.now()
+    const ent = this._readEntry(key, now)
     if (!ent) return null
-    if (Date.now() > ent.expires_at) {
+    if (now > ent.expires_at) {
       this.repo.remove(key)
+      this.cache.delete(key)
       return null
     }
     return {
@@ -449,7 +522,7 @@ export class StickyRouter {
   ) {
     if (!key || !this.config.enabled) return false
     const ttl = (this.config.ttl_seconds || 86400) * 1000
-    const prev = this.repo.get(key) || {}
+    const prev = this._readEntry(key) || {}
     const prevGeneration = Number(prev.generation) || 0
     if (ifGeneration != null && prevGeneration !== Number(ifGeneration)) return false
     const vmChanged = !!(prev.vm_id && vmId && prev.vm_id !== vmId)
@@ -478,11 +551,11 @@ export class StickyRouter {
           ? prev.session_id || sessionId || null
           : sessionId || prev.session_id || null
     const device = String(deviceId || '').trim()
-    this.repo.upsert(key, {
+    this._writeEntry(key, {
       account_id: nextAccount,
       vm_id: nextVm,
       session_id: nextSessionId,
-      device_id: device || null,
+      device_id: device || prev.device_id || null,
       bound_at: Date.now(),
       expires_at: Date.now() + ttl,
       hits: (prev.hits || 0) + (countHit ? 1 : 0),
@@ -496,9 +569,9 @@ export class StickyRouter {
   rebindFamily(key, { accountId, vmId } = {}) {
     if (!key || !this.config.enabled || !accountId || !vmId) return null
     const ttl = (this.config.ttl_seconds || 86400) * 1000
-    const prev = this.repo.get(key) || {}
+    const prev = this._readEntry(key) || {}
     const generation = (Number(prev.generation) || 0) + 1
-    this.repo.upsert(key, {
+    this._writeEntry(key, {
       account_id: accountId,
       vm_id: vmId,
       session_id: null,
@@ -516,11 +589,11 @@ export class StickyRouter {
   bindDeviceAffinity(key, { accountId, vmId } = {}, { countHit = false } = {}) {
     if (!key || !this.config.enabled || !accountId || !vmId) return null
     const ttl = (this.config.ttl_seconds || 86400) * 1000
-    const prev = this.repo.get(key) || {}
+    const prev = this._readEntry(key) || {}
     const changed = !!(prev.vm_id && (prev.account_id !== accountId || prev.vm_id !== vmId))
     const prevGeneration = Number(prev.generation) || 0
     const generation = prev.vm_id ? (changed ? prevGeneration + 1 : prevGeneration || 1) : 1
-    this.repo.upsert(key, {
+    this._writeEntry(key, {
       account_id: accountId,
       vm_id: vmId,
       session_id: null,
@@ -584,10 +657,18 @@ export class StickyRouter {
   unbind(key) {
     if (!key) return
     this.repo.remove(key)
+    this.cache.delete(key)
   }
 
   unbindByAccount({ accountId = null, vmId = null } = {}) {
-    return this.repo.removeByAccount({ accountId, vmId })
+    const removed = this.repo.removeByAccount({ accountId, vmId })
+    if (removed) {
+      for (const [key, cached] of this.cache) {
+        const ent = cached.value
+        if ((accountId && ent?.account_id === accountId) || (vmId && ent?.vm_id === vmId)) this.cache.delete(key)
+      }
+    }
+    return removed
   }
 
   /** Live keys pinned to this account or VM, so their windows leave with them. */
@@ -600,7 +681,14 @@ export class StickyRouter {
   }
 
   _purge() {
-    this.repo.purgeExpired(Date.now())
+    const now = Date.now()
+    const removed = this.repo.purgeExpired(now)
+    if (removed) {
+      for (const [key, cached] of this.cache) {
+        if (cached.value && now > cached.value.expires_at) this.cache.delete(key)
+      }
+    }
+    return removed
   }
 
   stats() {
@@ -616,7 +704,13 @@ export class StickyRouter {
     }
   }
 
+  activeSessionCount() {
+    this._purge()
+    return Number(this.repo.count() || 0)
+  }
+
   reloadConfig(config) {
     this.config = mergeStickyConfig(config)
+    this.cache.clear()
   }
 }

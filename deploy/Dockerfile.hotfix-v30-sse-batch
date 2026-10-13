@@ -1,0 +1,5 @@
+FROM vm2api-local:v1.3.153-hotfix-v29-performance
+
+COPY src/lib/transport/go-worker-client.mjs /opt/vm2api/src/lib/transport/go-worker-client.mjs
+COPY src/lib/protocol/handle-codex.mjs /opt/vm2api/src/lib/protocol/handle-codex.mjs
+COPY src/lib/protocol/stream-keepalive.mjs /opt/vm2api/src/lib/protocol/stream-keepalive.mjs

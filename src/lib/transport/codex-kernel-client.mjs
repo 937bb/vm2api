@@ -5,14 +5,26 @@
 import path from 'node:path'
 import { callGoWorker, streamGoWorker, workerHealth, workerPaths } from './go-worker-client.mjs'
 
+function codexKernelStem() {
+  const instance = String(process.env.KIN_CODEX_KERNEL_INSTANCE || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 64)
+  return instance ? `codex-kernel-${instance}` : 'codex-kernel'
+}
+
 export function codexKernelPaths(exec = {}) {
   const base = workerPaths(exec)
   const runDir = base.runDir
+  const stem = codexKernelStem()
   return {
     runDir,
-    socketPath: exec.vm?.runtime?.codex_kernel_socket || (runDir ? path.join(runDir, 'codex-kernel.sock') : null),
+    socketPath: exec.vm?.runtime?.codex_kernel_socket || (runDir ? path.join(runDir, `${stem}.sock`) : null),
     tokenPath: base.tokenPath,
-    configPath: runDir ? path.join(runDir, 'codex-kernel.json') : null,
+    configPath: runDir ? path.join(runDir, `${stem}.json`) : null,
+    logPath: runDir ? path.join(runDir, `${stem}.log`) : null,
+    pidPath: runDir ? path.join(runDir, `${stem}.pid`) : null,
     credentialPath: runDir ? path.join(path.dirname(runDir), 'codex-credentials.json') : null,
   }
 }
@@ -52,11 +64,13 @@ export async function callCodexKernel(opts = {}) {
 }
 
 export async function streamCodexKernel(opts = {}) {
+  const { responsesPassthrough = false, ...request } = opts
   return remapVia(
     await streamGoWorker({
-      ...opts,
-      exec: withCodexKernelExec(opts.exec),
+      ...request,
+      exec: withCodexKernelExec(request.exec),
       requestPath: '/internal/v1/codex/responses',
+      sseEventMode: responsesPassthrough ? 'responses-passthrough' : null,
     }),
   )
 }

@@ -19,7 +19,7 @@ import { validTimezone } from '../core/timezone.mjs'
 import { lookupProxyGeo, lookupProxyGeoV6 } from './proxy-geo.mjs'
 import { DNS_PRIMARY_AUTO, DNS_UPSTREAMS, LOCAL_EGRESS_ID, isLocalEgressProxy, validDnsPrimary } from './egress.mjs'
 import { normalizeSocksHost, socksEndpoint, socksProxyUrl, socksProxyFamily } from './socks-address.mjs'
-import { proxyBlockedReason } from './proxy-policy.mjs'
+import { invalidateProxyPolicyCache, proxyBlockedReason } from './proxy-policy.mjs'
 import { canRevealClusterNodes, annotatePublicLocalProxy } from './local-proxy-nodes.mjs'
 
 export const MAX_VMS_PER_PROXY = 5
@@ -829,6 +829,7 @@ export class ProxyPool extends EventEmitter {
     }
     if (patch.ipv6_enabled != null) this.state.config.ipv6_enabled = patch.ipv6_enabled
     this.save()
+    invalidateProxyPolicyCache()
     if (patch.ipv6_enabled === false) {
       for (const [socket, proxy] of this._probeSockets) {
         if (socksProxyFamily(proxy) === 6) socket.destroy()

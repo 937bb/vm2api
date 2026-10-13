@@ -1,0 +1,4 @@
+FROM vm2api-local:v1.3.148-hotfix-503-v17
+
+COPY src/lib/transport/codex-kernel-supervisor.mjs /opt/vm2api/src/lib/transport/codex-kernel-supervisor.mjs
+COPY src/lib/transport/go-worker-client.mjs /opt/vm2api/src/lib/transport/go-worker-client.mjs

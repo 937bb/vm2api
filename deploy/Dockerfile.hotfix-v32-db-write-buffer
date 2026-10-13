@@ -1,0 +1,10 @@
+FROM vm2api-local:v1.3.153-hotfix-v31-first-event-timeout
+
+COPY src/lib/db/buffered-write-queue.mjs /opt/vm2api/src/lib/db/buffered-write-queue.mjs
+COPY src/lib/db/repos/api-keys-repo.mjs /opt/vm2api/src/lib/db/repos/api-keys-repo.mjs
+COPY src/lib/db/repos/request-attempts-repo.mjs /opt/vm2api/src/lib/db/repos/request-attempts-repo.mjs
+COPY src/lib/admin/api-keys.mjs /opt/vm2api/src/lib/admin/api-keys.mjs
+COPY src/lib/admin/backup-service.mjs /opt/vm2api/src/lib/admin/backup-service.mjs
+COPY src/lib/admin/request-log.mjs /opt/vm2api/src/lib/admin/request-log.mjs
+COPY src/lib/admin/routing-runtime.mjs /opt/vm2api/src/lib/admin/routing-runtime.mjs
+COPY src/server.mjs /opt/vm2api/src/server.mjs

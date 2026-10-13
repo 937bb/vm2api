@@ -1,5 +1,6 @@
 .git
 .github
+**/._*
 node_modules
 web/node_modules
 bin

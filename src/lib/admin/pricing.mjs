@@ -366,6 +366,7 @@ export function emptyCostBucket() {
     output_tokens: 0,
     cache_read_tokens: 0,
     cache_creation_tokens: 0,
+    prompt_tokens: 0,
     input_cost: 0,
     output_cost: 0,
     cache_read_cost: 0,
@@ -384,6 +385,7 @@ export function sumCostBuckets(rows = []) {
     out.output_tokens += n(r.output_tokens)
     out.cache_read_tokens += n(r.cache_read_tokens)
     out.cache_creation_tokens += n(r.cache_creation_tokens)
+    out.prompt_tokens += n(r.prompt_tokens)
     out.input_cost = round8(out.input_cost + n(r.input_cost))
     out.output_cost = round8(out.output_cost + n(r.output_cost))
     out.cache_read_cost = round8(out.cache_read_cost + n(r.cache_read_cost))

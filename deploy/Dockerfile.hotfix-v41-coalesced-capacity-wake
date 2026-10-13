@@ -1,0 +1,9 @@
+FROM vm2api-local:v1.3.153-hotfix-v40-bounded-lease-poll
+LABEL org.opencontainers.image.version="1.3.153-hotfix-v41-coalesced-capacity-wake"
+
+COPY src/lib/pool/openai-global-lease.mjs /opt/vm2api/src/lib/pool/openai-global-lease.mjs
+COPY src/lib/pool/openai-account-runtime.mjs /opt/vm2api/src/lib/pool/openai-account-runtime.mjs
+COPY src/lib/protocol/handle-codex.mjs /opt/vm2api/src/lib/protocol/handle-codex.mjs
+
+RUN printf '%s\n' '1.3.153-hotfix-v41-coalesced-capacity-wake' > /opt/vm2api/VERSION
+ENV VM2API_BUILD=1.3.153-hotfix-v41-coalesced-capacity-wake

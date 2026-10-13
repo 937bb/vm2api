@@ -9,17 +9,24 @@ import { getVm } from '../../src/lib/vm/vm-registry.mjs'
 import { readCodexAccounts, writeCodexAccounts } from '../../src/lib/vm/codex-slot.mjs'
 import { invalidateReadCache } from '../../src/lib/vm/vm-file.mjs'
 
-function seed(root, id, { active = false } = {}) {
+function seed(root, id, { active = false, codex = false } = {}) {
   const dir = path.join(root, 'vms')
   fs.mkdirSync(dir, { recursive: true })
   fs.writeFileSync(
     path.join(dir, `${id}.json`),
-    JSON.stringify({ id, name: id, status: 'stopped', schedulable: false, policy: { maxConcurrency: 2 } }),
+    JSON.stringify({
+      id,
+      name: id,
+      status: 'stopped',
+      schedulable: true,
+      policy: { maxConcurrency: 2 },
+      ...(codex ? { platform: 'openai', family: 'codex', codex_kernel: true, codex: {} } : {}),
+    }),
   )
   if (active) fs.writeFileSync(path.join(dir, 'active.json'), JSON.stringify({ active_vm: id }))
 }
 
-function handler(project) {
+function handler(project, overrides = {}) {
   const response = {}
   const cfg = { paths: { project }, vm: { id: 'stale' } }
   const handlePanel = createPanelHandler({
@@ -36,6 +43,7 @@ function handler(project) {
     },
     readBody: async () => ({}),
     proxyPool: { unbindVm() {} },
+    ...overrides,
   })
   return { handlePanel, response, cfg }
 }
@@ -52,6 +60,74 @@ test('fresh deploy can delete its only active VM', async () => {
     assert.equal(fs.existsSync(path.join(root, 'vms', 'active.json')), false)
     reloadActiveVm(cfg)
     assert.equal(cfg.vm.id, null)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('Codex deletion retires the account and preserves credentials while a request is active', async () => {
+  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-del-codex-busy-'))
+  const previousRedis = process.env.KIN_OPENAI_REDIS_URL
+  delete process.env.KIN_OPENAI_REDIS_URL
+  rt.resetOpenAIAccountRuntime()
+  try {
+    seed(root, 'vm-gpt-01', { codex: true })
+    fs.mkdirSync(path.join(root, 'vms', 'vm-gpt-01'), { recursive: true })
+    writeCodexAccounts(root, 'vm-gpt-01', [{ access_token: 'active-secret' }])
+    const held = rt.tryAcquireOpenAISlot('vm-gpt-01', { concurrency: 2 })
+    assert.ok(held)
+    const { handlePanel, response } = handler(root, { destroySlot: async () => ({ ok: true }) })
+
+    await handlePanel({ method: 'DELETE' }, {}, new URL('http://localhost/api/panel/vms/vm-gpt-01'))
+
+    assert.equal(response.status, 409, JSON.stringify(response.body))
+    assert.equal(response.body?.error?.code, 'vm_in_flight')
+    assert.equal(response.body?.error?.details?.in_flight, 1)
+    assert.equal(readCodexAccounts(root, 'vm-gpt-01')[0].access_token, 'active-secret')
+    const retiring = getVm(root, 'vm-gpt-01')
+    assert.equal(retiring.schedulable, false)
+    assert.equal(retiring.schedule_disabled_reason, 'account_retiring')
+    assert.equal(rt.openAIRuntimeSignals('vm-gpt-01').retirementBlocked, true)
+
+    held.release()
+    const resumed = handler(root, {
+      destroySlot: async () => ({ ok: true }),
+      readBody: async () => ({ schedulable: true }),
+    })
+    await resumed.handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/vm-gpt-01/schedulable'))
+    assert.equal(resumed.response.status, 200, JSON.stringify(resumed.response.body))
+    assert.equal(getVm(root, 'vm-gpt-01').schedulable, true)
+    assert.equal(rt.openAIRuntimeSignals('vm-gpt-01').retirementBlocked, false)
+
+    await resumed.handlePanel({ method: 'DELETE' }, {}, new URL('http://localhost/api/panel/vms/vm-gpt-01'))
+    assert.equal(resumed.response.status, 200, JSON.stringify(resumed.response.body))
+    assert.equal(getVm(root, 'vm-gpt-01'), null)
+    assert.deepEqual(readCodexAccounts(root, 'vm-gpt-01'), [])
+  } finally {
+    rt.resetOpenAIAccountRuntime()
+    if (previousRedis == null) delete process.env.KIN_OPENAI_REDIS_URL
+    else process.env.KIN_OPENAI_REDIS_URL = previousRedis
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('slot destroy failure never deletes the VM record or credential directory', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-del-destroy-failed-'))
+  try {
+    seed(root, 'vm-02')
+    fs.mkdirSync(path.join(root, 'vms', 'vm-02'), { recursive: true })
+    fs.writeFileSync(path.join(root, 'vms', 'vm-02', 'credential'), 'keep')
+    const { handlePanel, response } = handler(root, {
+      destroySlot: async () => ({ ok: false, code: 'runtime_busy', error: 'runtime still active' }),
+    })
+
+    await handlePanel({ method: 'DELETE' }, {}, new URL('http://localhost/api/panel/vms/vm-02'))
+
+    assert.equal(response.status, 409, JSON.stringify(response.body))
+    assert.equal(response.body?.error?.code, 'runtime_busy')
+    assert.equal(fs.existsSync(path.join(root, 'vms', 'vm-02.json')), true)
+    assert.equal(fs.readFileSync(path.join(root, 'vms', 'vm-02', 'credential'), 'utf8'), 'keep')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

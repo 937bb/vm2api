@@ -332,9 +332,11 @@ test('shipped routing.json loads as canonical without the OpenAI legacy rewrite'
 
 test('OpenAI per-slot limit writes never invoke the Claude quota holder', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-openai-isolation-'))
-  fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
+  fs.mkdirSync(path.join(root, 'vms', 'vm-openai'), { recursive: true })
   const file = path.join(root, 'vms', 'vm-openai.json')
   fs.writeFileSync(file, JSON.stringify({ id: 'vm-openai', platform: 'openai', family: 'codex', policy: {} }))
+  const credentialFile = path.join(root, 'vms', 'vm-openai', 'codex-credentials.json')
+  fs.writeFileSync(credentialFile, JSON.stringify({ accounts: [{ access_token: 'at', max_concurrency: 1, rpm: 2 }] }))
   try {
     const runtime = createRoutingRuntime({ cfg: { paths: { project: root } } })
     runtime.applyVmConcurrency('vm-openai', 3)
@@ -349,6 +351,10 @@ test('OpenAI per-slot limit writes never invoke the Claude quota holder', () => 
       maxSessions: 4,
       sessionsOverride: true,
     })
+    const account = JSON.parse(fs.readFileSync(credentialFile, 'utf8')).accounts[0]
+    assert.equal(account.max_concurrency, 3)
+    assert.equal(account.rpm, 37)
+    assert.equal(account.access_token, 'at')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

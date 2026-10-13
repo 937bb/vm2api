@@ -1,0 +1,3 @@
+FROM vm2api-local:v1.3.153-hotfix-v30-sse-batch
+
+COPY src/lib/transport/go-worker-client.mjs /opt/vm2api/src/lib/transport/go-worker-client.mjs

@@ -35,6 +35,8 @@ patches/
 !src/config/gateway-v2.example.json
 
 # local / editor / agent trees — never publish
+.DS_Store
+._*
 .claude/
 .cursor/
 .pi/

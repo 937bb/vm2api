@@ -116,3 +116,32 @@ test('GPT usage row without pool email takes slot email', (t) => {
   assert.equal(row?.email, 'lemeryvorhees@gmail.com')
   assert.equal(row?.total_cost, 139.87)
 })
+
+test('GPT usage totals do not count cached tokens twice in the denominator', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-gpt-cache-rate-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
+  fs.writeFileSync(
+    path.join(root, 'vms', 'vm-codex-01.json'),
+    JSON.stringify({ id: 'vm-codex-01', platform: 'openai', family: 'codex', codex_kernel: true }),
+  )
+  const usage = buildUsage({
+    accountQuota: {
+      snapshot: () => ({
+        accounts: [
+          {
+            account_id: 'vm-codex-01',
+            vm_id: 'vm-codex-01',
+            tokens_in: 100,
+            cache_read_tokens: 80,
+            cache_creation_tokens: 0,
+          },
+        ],
+      }),
+    },
+    cfg: { paths: { project: root } },
+    requestLog: { billingStats: () => ({ accounts: [] }) },
+  })
+  assert.equal(usage.data.totals.prompt_tokens, 100)
+  assert.equal(usage.data.totals.cache_hit_rate, 0.8)
+})

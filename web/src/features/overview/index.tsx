@@ -34,10 +34,7 @@ import { HostColumn } from '@/features/overview/host-column'
 import { KpiCard } from '@/features/overview/kpi-card'
 import { OverviewSkeleton } from '@/features/overview/overview-skeleton'
 import { PoolQuota } from '@/features/overview/pool-quota'
-import {
-  dashboardQueryOptions,
-  usageQueryOptions,
-} from '@/features/overview/queries'
+import { overviewDashboardQueryOptions } from '@/features/overview/queries'
 import { TrafficOps } from '@/features/overview/traffic-ops'
 
 type AlertTone = 'caution' | 'warn' | 'bad'
@@ -69,14 +66,13 @@ function AlertChip({
 }
 
 export function OverviewPage() {
-  const dash = useQuery(dashboardQueryOptions())
-  const usage = useQuery(usageQueryOptions())
+  const dash = useQuery(overviewDashboardQueryOptions())
   const since = opsSince('1h')
-  const stats = useQuery(logStatsQueryOptions(since))
+  const stats = useQuery(logStatsQueryOptions(since, undefined, 'hour', true))
   const d = dash.data || {}
   const vms: Vm[] = d.vms || []
   const summary = (d.summary || {}) as Record<string, unknown>
-  const totals = (usage.data?.totals || {}) as Record<string, unknown>
+  const totals = summary
   const gstat = (d.gateway_stats || {}) as Record<string, unknown>
   const running = vms.filter(vmRunning).length
   const withToken = vms.filter((v) => v.has_token).length
@@ -99,7 +95,9 @@ export function OverviewPage() {
   const errs = Number(gstat.errors || 0)
   const buckets = vmBuckets(vms)
   const score = healthScore(vms)
-  const cacheHitRate = summary.cache_hit_rate as number | null | undefined
+  const statsWindow = stats.data?.window
+  const cacheHitRate = (statsWindow?.cache_hit_rate ??
+    summary.cache_hit_rate) as number | null | undefined
   const cachePct =
     cacheHitRate != null
       ? cacheHitRate * 100
@@ -110,7 +108,6 @@ export function OverviewPage() {
         )
 
   // `currentOps()` 等价逻辑：优先 request-logs/stats 的 window，回落 dashboard.ops。
-  const statsWindow = stats.data?.window
   const ops: OpsWindow | undefined =
     statsWindow && (statsWindow.error || statsWindow.requests != null)
       ? statsWindow

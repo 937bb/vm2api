@@ -138,11 +138,38 @@ export function unitPricePerMillion(
   return ((amount * 1e6) / tokens).toFixed(2)
 }
 
-/** 实际缓存率 = 读取 / (输入 + 读取 + 写入)，0-1；无输入侧 token 返回 null。 */
+function usesInclusiveOpenAiInput(row: UsageLogRow): boolean {
+  // Non-streaming API conversion persists Anthropic's disjoint usage shape,
+  // even when the selected model name is GPT. Route evidence wins over model
+  // fallbacks for these rows.
+  if (
+    row.via === 'api-kernel' &&
+    row.protocol === 'anthropic.messages' &&
+    row.stream === false
+  )
+    return false
+  if (String(row.via || '').startsWith('codex-')) return true
+  const model = String(
+    row.costBreakdown?.pricingModel ||
+      row.actualResponseModel ||
+      row.model ||
+      row.originalModel ||
+      ''
+  )
+    .trim()
+    .toLowerCase()
+  return (
+    model.startsWith('codex-') ||
+    (model.startsWith('gpt') && !model.startsWith('gpt-image'))
+  )
+}
+
+/** OpenAI 输入已含缓存读取；Anthropic 的输入、缓存读写互斥。 */
 export function actualCacheRate(row: UsageLogRow): number | null {
-  const total =
-    row.inputTokens + row.cacheReadInputTokens + row.cacheCreationInputTokens
-  return total > 0 ? row.cacheReadInputTokens / total : null
+  const total = usesInclusiveOpenAiInput(row)
+    ? row.inputTokens
+    : row.inputTokens + row.cacheReadInputTokens + row.cacheCreationInputTokens
+  return total > 0 ? Math.min(1, row.cacheReadInputTokens / total) : null
 }
 
 // ---------- 倍率 / 特殊开关 ----------

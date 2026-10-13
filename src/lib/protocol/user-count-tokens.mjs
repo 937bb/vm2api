@@ -363,7 +363,16 @@ export async function handleUserUsage(req, res, deps) {
     inbound: {},
     usersRepo: deps.apiKeyStore?.users || null,
   })
-  if (!peeked.ok) return sendPoolFail(res, json, peeked)
+  if (!peeked.ok) {
+    // /v1/usage is a Claude OAuth/Setup Token capability probe. A GPT-only
+    // fleet has no eligible account by construction; that is unsupported, not
+    // a transient gateway outage.
+    if (peeked.code === 'no_eligible_accounts') {
+      const err = usageUnsupportedError()
+      return json(res, err.status, err.body)
+    }
+    return sendPoolFail(res, json, peeked)
+  }
   const mode = credentialModeOfVm(peeked.vm)
   if (!canOfficialUsage(mode)) {
     const err = usageUnsupportedError()

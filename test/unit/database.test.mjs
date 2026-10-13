@@ -27,6 +27,9 @@ afterEach(() => {
   closeDatabase()
   fs.rmSync(tmp, { recursive: true, force: true })
   delete process.env.KIN_DB_PATH
+  delete process.env.KIN_SQLITE_CACHE_KIB
+  delete process.env.KIN_SQLITE_MMAP_BYTES
+  delete process.env.KIN_SQLITE_TEMP_STORE
 })
 
 test('openDatabase creates db, applies migrations, WAL enabled', () => {
@@ -35,6 +38,9 @@ test('openDatabase creates db, applies migrations, WAL enabled', () => {
   assert.equal(getDbPath(), path.join(tmp, 'kin.db'))
   const mode = db.prepare('PRAGMA journal_mode').get()
   assert.equal(String(Object.values(mode)[0]).toLowerCase(), 'wal')
+  assert.equal(Object.values(db.prepare('PRAGMA cache_size').get())[0], -65_536)
+  assert.equal(Object.values(db.prepare('PRAGMA mmap_size').get())[0], 268_435_456)
+  assert.equal(Object.values(db.prepare('PRAGMA temp_store').get())[0], 2)
   const tables = db
     .prepare("SELECT name FROM sqlite_master WHERE type='table'")
     .all()
@@ -68,6 +74,16 @@ test('openDatabase creates db, applies migrations, WAL enabled', () => {
     .all()
     .map((r) => r.name)
   assert.ok(keyCols.includes('category'), 'api_keys missing category')
+})
+
+test('SQLite performance PRAGMAs clamp untrusted environment values', () => {
+  process.env.KIN_SQLITE_CACHE_KIB = '999999999'
+  process.env.KIN_SQLITE_MMAP_BYTES = '-50'
+  process.env.KIN_SQLITE_TEMP_STORE = 'not-a-pragma'
+  const db = openDatabase({ dataDir: tmp })
+  assert.equal(Object.values(db.prepare('PRAGMA cache_size').get())[0], -1_048_576)
+  assert.equal(Object.values(db.prepare('PRAGMA mmap_size').get())[0], 0)
+  assert.equal(Object.values(db.prepare('PRAGMA temp_store').get())[0], 2)
 })
 
 test('migration 005 adds protocol usage alignment columns', () => {

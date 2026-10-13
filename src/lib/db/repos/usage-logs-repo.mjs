@@ -192,6 +192,24 @@ function bucketEventsSince(rows = [], sinceMs) {
   )
 }
 
+function cacheHitStatsFromPrompt(row = {}) {
+  const base = cacheHitStats(row)
+  if (row.prompt_tokens == null) return base
+  const prompt = Number(row.prompt_tokens) || 0
+  const read = Number(row.cache_read_tokens) || 0
+  return {
+    ...base,
+    prompt_tokens: prompt,
+    cache_hit_rate: prompt > 0 ? Math.min(1, read / prompt) : null,
+  }
+}
+
+function costBucketFromPrefixedRow(row, prefix) {
+  const out = emptyCostBucket()
+  for (const key of Object.keys(out)) out[key] = Number(row?.[`${prefix}_${key}`] || 0)
+  return out
+}
+
 function filterCond({ since = null, until = null, vmId = null, accountId = null, apiKeyId = null } = {}) {
   const { cond, params } = timeCond(since, until)
   const parts = cond ? [cond.replace(/^WHERE /, '')] : []
@@ -512,7 +530,7 @@ export class UsageLogsRepo {
       FROM usage_logs
     `)
       .get()
-    return { ...row, ...cacheHitStats(row) }
+    return { ...row, ...cacheHitStatsFromPrompt(row) }
   }
 
   /**
@@ -604,7 +622,7 @@ export class UsageLogsRepo {
       cache_creation_cost: Number(row?.cache_creation_cost || 0),
       total_cost: Number(row?.total_cost || 0),
     }
-    return { ...out, ...cacheHitStats(out) }
+    return { ...out, ...cacheHitStatsFromPrompt(out) }
   }
 
   costByAccount({ since = null, until = null } = {}) {
@@ -875,21 +893,18 @@ export class UsageLogsRepo {
     const keyOf = (a) => a.account_id + '\0' + (a.vm_id || '')
     const todayById = new Map(accountsToday.map((a) => [keyOf(a), a]))
     const aligned = Array.isArray(accountWindows) && accountWindows.length > 0
-    const events = aligned ? this._costEventsSince(sevenDStart) : null
     const fiveById = aligned ? null : new Map(this.costByAccount({ since: fiveHStart }).map((a) => [keyOf(a), a]))
     const sevenById = aligned ? null : new Map(this.costByAccount({ since: sevenDStart }).map((a) => [keyOf(a), a]))
-    const eventsByKey = aligned ? groupCostEvents(events) : null
+    const alignedById = aligned
+      ? this._costByAlignedWindows(accountsTotal, accountWindows, { now, fiveHStart, sevenDStart })
+      : null
     const accounts = accountsTotal.map((a) => {
       const t = todayById.get(keyOf(a)) || emptyCostBucket()
-      const win = aligned ? resolveAccountWindow(accountWindows, a) : null
-      const since5 = aligned ? (extraWindowSince(win?.reset_5h, WINDOW_5H_MS, now) ?? Date.parse(fiveHStart)) : null
-      const since7 = aligned ? (extraWindowSince(win?.reset_7d, WINDOW_7D_MS, now) ?? Date.parse(sevenDStart)) : null
-      const w = aligned
-        ? bucketEventsSince(eventsByKey.get(keyOf(a)) || [], since5)
-        : fiveById.get(keyOf(a)) || emptyCostBucket()
-      const w7 = aligned
-        ? bucketEventsSince(eventsByKey.get(keyOf(a)) || [], since7)
-        : sevenById.get(keyOf(a)) || emptyCostBucket()
+      const alignedWindows = aligned ? alignedById.get(keyOf(a)) : null
+      const since5 = alignedWindows?.since5 ?? null
+      const since7 = alignedWindows?.since7 ?? null
+      const w = aligned ? alignedWindows?.five || emptyCostBucket() : fiveById.get(keyOf(a)) || emptyCostBucket()
+      const w7 = aligned ? alignedWindows?.seven || emptyCostBucket() : sevenById.get(keyOf(a)) || emptyCostBucket()
       return {
         ...a,
         today: { ...t },
@@ -926,13 +941,13 @@ export class UsageLogsRepo {
     const window5h = aligned
       ? {
           ...sumCostBuckets(accounts.map((a) => a.window_5h)),
-          ...cacheHitStats(sumCostBuckets(accounts.map((a) => a.window_5h))),
+          ...cacheHitStatsFromPrompt(sumCostBuckets(accounts.map((a) => a.window_5h))),
         }
       : this._costSelect('WHERE created_at >= ?', [fiveHStart])
     const window7d = aligned
       ? {
           ...sumCostBuckets(accounts.map((a) => a.window_7d)),
-          ...cacheHitStats(sumCostBuckets(accounts.map((a) => a.window_7d))),
+          ...cacheHitStatsFromPrompt(sumCostBuckets(accounts.map((a) => a.window_7d))),
         }
       : this._costSelect('WHERE created_at >= ?', [sevenDStart])
     return {
@@ -951,6 +966,68 @@ export class UsageLogsRepo {
       total,
       accounts,
     }
+  }
+
+  /**
+   * Aggregate account-specific reset windows in SQLite. The previous path
+   * materialized every usage row from the last seven days in JS on each panel
+   * refresh, blocking the event loop and amplifying GC under inference load.
+   */
+  _costByAlignedWindows(accounts, accountWindows, { now, fiveHStart, sevenDStart }) {
+    const stmt = this.db.prepare(`
+      WITH cutoff(five_since, seven_since, scan_since) AS (VALUES (?, ?, ?))
+      SELECT
+        SUM(CASE WHEN created_at >= cutoff.five_since THEN 1 ELSE 0 END) AS five_requests,
+        SUM(CASE WHEN created_at >= cutoff.five_since AND ${SLA_SUCCESS_PRED} THEN 1 ELSE 0 END) AS five_success,
+        SUM(CASE WHEN created_at >= cutoff.five_since AND ${SLA_ERROR_PRED} THEN 1 ELSE 0 END) AS five_errors,
+        COALESCE(SUM(CASE WHEN created_at >= cutoff.five_since THEN input_tokens ELSE 0 END), 0) AS five_input_tokens,
+        COALESCE(SUM(CASE WHEN created_at >= cutoff.five_since THEN output_tokens ELSE 0 END), 0) AS five_output_tokens,
+        COALESCE(SUM(CASE WHEN created_at >= cutoff.five_since THEN cache_read_tokens ELSE 0 END), 0) AS five_cache_read_tokens,
+        COALESCE(SUM(CASE WHEN created_at >= cutoff.five_since THEN cache_creation_tokens ELSE 0 END), 0) AS five_cache_creation_tokens,
+        COALESCE(SUM(CASE WHEN created_at >= cutoff.five_since THEN (${PROMPT_TOKENS_SQL}) ELSE 0 END), 0) AS five_prompt_tokens,
+        COALESCE(SUM(CASE WHEN created_at >= cutoff.five_since THEN input_cost ELSE 0 END), 0) AS five_input_cost,
+        COALESCE(SUM(CASE WHEN created_at >= cutoff.five_since THEN output_cost ELSE 0 END), 0) AS five_output_cost,
+        COALESCE(SUM(CASE WHEN created_at >= cutoff.five_since THEN cache_read_cost ELSE 0 END), 0) AS five_cache_read_cost,
+        COALESCE(SUM(CASE WHEN created_at >= cutoff.five_since THEN cache_creation_cost ELSE 0 END), 0) AS five_cache_creation_cost,
+        COALESCE(SUM(CASE WHEN created_at >= cutoff.five_since THEN total_cost ELSE 0 END), 0) AS five_total_cost,
+        SUM(CASE WHEN created_at >= cutoff.seven_since THEN 1 ELSE 0 END) AS seven_requests,
+        SUM(CASE WHEN created_at >= cutoff.seven_since AND ${SLA_SUCCESS_PRED} THEN 1 ELSE 0 END) AS seven_success,
+        SUM(CASE WHEN created_at >= cutoff.seven_since AND ${SLA_ERROR_PRED} THEN 1 ELSE 0 END) AS seven_errors,
+        COALESCE(SUM(CASE WHEN created_at >= cutoff.seven_since THEN input_tokens ELSE 0 END), 0) AS seven_input_tokens,
+        COALESCE(SUM(CASE WHEN created_at >= cutoff.seven_since THEN output_tokens ELSE 0 END), 0) AS seven_output_tokens,
+        COALESCE(SUM(CASE WHEN created_at >= cutoff.seven_since THEN cache_read_tokens ELSE 0 END), 0) AS seven_cache_read_tokens,
+        COALESCE(SUM(CASE WHEN created_at >= cutoff.seven_since THEN cache_creation_tokens ELSE 0 END), 0) AS seven_cache_creation_tokens,
+        COALESCE(SUM(CASE WHEN created_at >= cutoff.seven_since THEN (${PROMPT_TOKENS_SQL}) ELSE 0 END), 0) AS seven_prompt_tokens,
+        COALESCE(SUM(CASE WHEN created_at >= cutoff.seven_since THEN input_cost ELSE 0 END), 0) AS seven_input_cost,
+        COALESCE(SUM(CASE WHEN created_at >= cutoff.seven_since THEN output_cost ELSE 0 END), 0) AS seven_output_cost,
+        COALESCE(SUM(CASE WHEN created_at >= cutoff.seven_since THEN cache_read_cost ELSE 0 END), 0) AS seven_cache_read_cost,
+        COALESCE(SUM(CASE WHEN created_at >= cutoff.seven_since THEN cache_creation_cost ELSE 0 END), 0) AS seven_cache_creation_cost,
+        COALESCE(SUM(CASE WHEN created_at >= cutoff.seven_since THEN total_cost ELSE 0 END), 0) AS seven_total_cost
+      FROM usage_logs, cutoff
+      WHERE created_at >= cutoff.scan_since
+        AND vm_id IS ?
+        AND COALESCE(NULLIF(final_account_id, ''), NULLIF(account_id, ''), vm_id, '—') = ?
+    `)
+    const out = new Map()
+    for (const account of accounts || []) {
+      const win = resolveAccountWindow(accountWindows, account)
+      const since5 = extraWindowSince(win?.reset_5h, WINDOW_5H_MS, now) ?? Date.parse(fiveHStart)
+      const since7 = extraWindowSince(win?.reset_7d, WINDOW_7D_MS, now) ?? Date.parse(sevenDStart)
+      const row = stmt.get(
+        new Date(since5).toISOString(),
+        new Date(since7).toISOString(),
+        new Date(Math.min(since5, since7)).toISOString(),
+        account.vm_id,
+        account.account_id,
+      )
+      out.set(account.account_id + '\0' + (account.vm_id || ''), {
+        since5,
+        since7,
+        five: costBucketFromPrefixedRow(row, 'five'),
+        seven: costBucketFromPrefixedRow(row, 'seven'),
+      })
+    }
+    return out
   }
 
   _costEventsSince(since) {
@@ -1094,7 +1171,7 @@ export class UsageLogsRepo {
     const outputTokens = Number(counts?.output_tokens || 0)
     const cacheRead = Number(counts?.cache_read_tokens || 0)
     const cacheWrite = Number(counts?.cache_creation_tokens || 0)
-    const cache = cacheHitStats({
+    const cache = cacheHitStatsFromPrompt({
       input_tokens: inputTokens,
       cache_read_tokens: cacheRead,
       cache_creation_tokens: cacheWrite,

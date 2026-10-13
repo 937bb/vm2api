@@ -16,6 +16,7 @@ import {
   responsesSseToChatChunk,
 } from '../protocol/codex-convert.mjs'
 import { usageFromSseLine } from '../protocol/handle-codex.mjs'
+import { writeWithBackpressure } from '../protocol/stream-backpressure.mjs'
 
 export function resolveInferenceBackend(req) {
   if (req?.apiKeyKind === 'managed') {
@@ -198,6 +199,7 @@ export async function runApiInference({
       res,
       converters,
       body,
+      signal,
     })
   }
 
@@ -299,18 +301,20 @@ export async function runApiInference({
     }
     if (protocol === 'anthropic.messages') {
       if (!res.headersSent) converters.writeSSEHeaders(res)
-      res.write(String(line).endsWith('\n') ? String(line) : `${line}\n`)
+      await writeWithBackpressure(res, String(line).endsWith('\n') ? String(line) : `${line}\n`, signal)
       return
     }
-    const writeChunks = (chunks) => {
+    const writeChunks = async (chunks) => {
       if (!chunks.length) return
       if (!res.headersSent) converters.writeSSEHeaders(res)
-      for (const chunk of chunks) res.write(`data: ${JSON.stringify(chunk)}\n\n`)
+      for (const chunk of chunks) {
+        if (!(await writeWithBackpressure(res, `data: ${JSON.stringify(chunk)}\n\n`, signal))) break
+      }
     }
-    if (protocol === 'openai.chat') writeChunks(converters.claudeSSELineToOpenAIChatChunks(line, state))
+    if (protocol === 'openai.chat') await writeChunks(converters.claudeSSELineToOpenAIChatChunks(line, state))
     else if (protocol === 'openai.completions')
-      writeChunks(converters.claudeSSELineToOpenAICompletionChunks(line, state))
-    else writeChunks(converters.claudeSSELineToResponsesEvents(line, state))
+      await writeChunks(converters.claudeSSELineToOpenAICompletionChunks(line, state))
+    else await writeChunks(converters.claudeSSELineToResponsesEvents(line, state))
   })
 
   const failure = classifierFailure()
@@ -335,6 +339,7 @@ async function runOpenAIResponsesUpstream({
   res,
   converters,
   body,
+  signal,
 }) {
   const chunks = []
   const anthropicSse = protocol === 'anthropic.messages' ? createAnthropicSseState() : null
@@ -359,7 +364,7 @@ async function runOpenAIResponsesUpstream({
     }
     if (!res.headersSent) converters.writeSSEHeaders(res)
     if (protocol === 'openai.responses') {
-      res.write(raw.endsWith('\n') ? raw : `${raw}\n`)
+      await writeWithBackpressure(res, raw.endsWith('\n') ? raw : `${raw}\n`, signal)
       if (/response\.(completed|done)/.test(raw)) completed = true
       return
     }
@@ -369,16 +374,18 @@ async function runOpenAIResponsesUpstream({
           ? responsesSseToAnthropicEvents(raw, anthropicSse)
           : responsesSseToChatChunk(raw, 'codex', chatSse)
       if (mapped) {
-        res.write(mapped)
+        await writeWithBackpressure(res, mapped, signal)
         if (mapped.includes('[DONE]') || mapped.includes('event: message_stop\n')) completed = true
       }
     } catch (error) {
       if (error.code !== 'tool_arguments_mismatch') throw error
       conversionError = { type: 'upstream_protocol_error', code: error.code, message: error.message }
-      res.write(
+      await writeWithBackpressure(
+        res,
         protocol === 'anthropic.messages'
           ? `event: error\ndata: ${JSON.stringify({ type: 'error', error: conversionError })}\n\n`
           : `data: ${JSON.stringify({ error: conversionError })}\n\ndata: [DONE]\n\n`,
+        signal,
       )
     }
   })

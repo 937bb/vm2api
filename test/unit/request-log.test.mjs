@@ -73,6 +73,30 @@ test('normal mode writes jsonl without body', () => {
   assert.equal(store.listDebug({ limit: 5 }).length, 0)
 })
 
+test('buffered mode commits summary and debug rows in one explicit flush', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-rlog-buffered-'))
+  const store = new RequestLogStore({
+    dataDir: dir,
+    mode: 'debug',
+    bufferedWrites: true,
+    writeBatchSize: 64,
+    writeFlushIntervalMs: 60_000,
+  })
+  for (let i = 0; i < 3; i += 1) {
+    const ctx = store.start(
+      { method: 'POST', headers: {}, socket: {} },
+      { protocol: 'openai.responses', pathName: '/v1/responses' },
+    )
+    store.finish(ctx, { status: 200, model: 'gpt-5.4', vm_id: 'vm-buffered' })
+  }
+  assert.equal(store.repo.count(), 0)
+  assert.equal(store.flushPending(), 3)
+  assert.equal(store.repo.count(), 3)
+  assert.equal(store.repo.listDebug({ limit: 10 }).length, 3)
+  assert.equal(store.snapshot().write_queue.pending, 0)
+  store.stop()
+})
+
 test('summary persists protocol usage detail (cache/model/ttft/stop_reason)', () => {
   const store = tmpStore('normal')
   const ctx = store.start(
@@ -363,6 +387,57 @@ test('billingStats Extra window excludes older logs outside reset-5h', () => {
   assert.equal(rolling.accounts[0].window_5h_requests, 2)
 })
 
+test('aligned billing windows aggregate in SQLite without materializing seven-day events', () => {
+  const store = tmpStore('normal')
+  const now = Date.parse('2026-09-26T12:00:00.000Z')
+  finishWith(store, 'claude-opus-5', { input_tokens: 100, output_tokens: 10 })
+  store.repo.db
+    .prepare("UPDATE usage_logs SET created_at = ?, vm_id = 'vm-t', account_id = 'acc-t' WHERE vm_id = 'vm-t'")
+    .run('2026-09-26T11:30:00.000Z')
+  store.repo._costEventsSince = () => {
+    throw new Error('seven-day event materialization must stay off the billing path')
+  }
+
+  const bill = store.billingStats({
+    now,
+    accountWindows: [
+      {
+        account_id: 'acc-t',
+        vm_id: 'vm-t',
+        reset_5h: '2026-09-26T16:00:00.000Z',
+        reset_7d: '2026-10-02T12:00:00.000Z',
+      },
+    ],
+  })
+  assert.equal(bill.accounts[0].window_5h_requests, 1)
+  assert.equal(bill.accounts[0].window_7d_requests, 1)
+  assert.equal(bill.window_5h.requests, 1)
+  assert.equal(bill.window_7d.requests, 1)
+})
+
+test('aligned billing scans the earlier cutoff when the 7d window reset is newer', () => {
+  const store = tmpStore('normal')
+  const now = Date.parse('2026-09-26T12:00:00.000Z')
+  finishWith(store, 'claude-opus-5', { input_tokens: 100, output_tokens: 10 })
+  store.repo.db
+    .prepare("UPDATE usage_logs SET created_at = ?, vm_id = 'vm-t', account_id = 'acc-t' WHERE vm_id = 'vm-t'")
+    .run('2026-09-26T11:30:00.000Z')
+
+  const bill = store.billingStats({
+    now,
+    accountWindows: [
+      {
+        account_id: 'acc-t',
+        vm_id: 'vm-t',
+        reset_5h: '2026-09-26T16:00:00.000Z',
+        reset_7d: '2026-09-26T11:45:00.000Z',
+      },
+    ],
+  })
+  assert.equal(bill.accounts[0].window_5h_requests, 1)
+  assert.equal(bill.accounts[0].window_7d_requests, 0)
+})
+
 test('billingStats aggregates official cost per account and today', () => {
   const store = tmpStore('normal')
   const ctx = store.start(
@@ -398,6 +473,42 @@ test('billingStats aggregates official cost per account and today', () => {
   assert.equal(models[0].model, 'claude-opus-5')
   assert.equal(models[0].total_cost, 5)
   assert.equal(models[0].input_tokens, 1_000_000)
+})
+
+test('billingStats reuses the short panel cache for identical account windows', () => {
+  const store = tmpStore('normal')
+  const original = store.repo.billingStats.bind(store.repo)
+  let calls = 0
+  store.repo.billingStats = (opts) => {
+    calls += 1
+    return original(opts)
+  }
+  const opts = {
+    now: Date.parse('2026-10-12T09:00:00.000Z'),
+    accountWindows: [{ account_id: 'acc-1', vm_id: 'vm-01', reset_5h: '2026-10-12T10:00:00.000Z' }],
+  }
+  assert.equal(store.billingStats(opts), store.billingStats(opts))
+  assert.equal(calls, 1)
+})
+
+test('dashboard aggregate readers reuse short snapshots and reload invalidates them', () => {
+  const store = tmpStore('normal')
+  let totalsCalls = 0
+  let windowCalls = 0
+  store.repo.totals = () => ({ call: ++totalsCalls })
+  store.repo.windowStats = (opts) => ({ call: ++windowCalls, ...opts })
+  const opts = { since: '2026-10-12T08:00:00.000Z' }
+
+  assert.equal(store.totals(), store.totals())
+  assert.equal(store.windowStats(opts), store.windowStats(opts))
+  assert.equal(totalsCalls, 1)
+  assert.equal(windowCalls, 1)
+
+  store.reload()
+  store.totals()
+  store.windowStats(opts)
+  assert.equal(totalsCalls, 2)
+  assert.equal(windowCalls, 2)
 })
 
 test('finish writes OpenAI Responses cache read and cache write', () => {
@@ -683,6 +794,25 @@ test('windowStats computes ttft percentiles, sla and qps', () => {
   assert.equal(filtered.items[0].error_label, '过载排队')
 })
 
+test('Codex cache rate uses inclusive OpenAI input tokens as the prompt denominator', () => {
+  const store = tmpStore('normal')
+  logOne(store, {
+    status: 200,
+    protocol: 'openai.responses',
+    via: 'codex-kernel',
+    model: 'gpt-5.4',
+    input_tokens: 100,
+    output_tokens: 10,
+    cache_read_tokens: 80,
+  })
+
+  const w = store.windowStats({ since: new Date(Date.now() - 60_000).toISOString() })
+  assert.equal(w.prompt_tokens, 100)
+  assert.equal(w.cache_hit_rate, 0.8)
+  assert.equal(store.totals().cache_hit_rate, 0.8)
+  assert.equal(store.billingStats().today.cache_hit_rate, 0.8)
+})
+
 test('windowStats treats 429 quota/rate-limit as SLA success', () => {
   const store = tmpStore('normal')
   logOne(store, { status: 200, first_token_ms: 80, duration_ms: 100, model: 'claude-sonnet-5' })
@@ -837,6 +967,15 @@ test('cleanup keeps 7-day summaries and drops 3-day-old debug', () => {
   store.cleanup()
   assert.equal(store.repo.count(), 1)
   assert.equal(store.repo.getDebug('rid-mid'), null)
+})
+
+test('normal cleanup skips the expensive debug byte scan', () => {
+  const store = tmpStore('normal')
+  store.setConfig({ maxMb: 1 })
+  store.repo.debugBytes = () => {
+    throw new Error('normal mode must not scan debug blobs')
+  }
+  assert.doesNotThrow(() => store.cleanup())
 })
 
 test('cleanup trims oldest debug rows when over max_mb', () => {

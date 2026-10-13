@@ -1,0 +1,5 @@
+FROM vm2api-local:v1.3.148-hotfix-503-v23-dashboard-singleflight
+
+COPY src/lib/pool/sticky-router.mjs /opt/vm2api/src/lib/pool/sticky-router.mjs
+COPY src/lib/admin/panel-api.mjs /opt/vm2api/src/lib/admin/panel-api.mjs
+COPY web/dist /opt/vm2api/web/dist

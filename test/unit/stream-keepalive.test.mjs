@@ -95,3 +95,26 @@ test('keepalive arm starts pinging before the first upstream event', async () =>
   keepalive.stop()
   assert.ok(writes.some((chunk) => chunk.includes('event: ping')))
 })
+
+test('skipped keepalive does not claim a downstream write', () => {
+  const keepalive = createDownstreamKeepalive({
+    intervalMs: 1,
+    protocol: 'openai.responses',
+    write: () => false,
+  })
+  keepalive.arm()
+  const before = keepalive.getState().lastWriteAt
+  keepalive.beat()
+  keepalive.stop()
+  assert.equal(keepalive.getState().lastWriteAt, before)
+})
+
+test('observeActivity resets idle time without parsing an SSE payload', () => {
+  const keepalive = createDownstreamKeepalive({ intervalMs: 0, protocol: 'openai.responses' })
+  keepalive.observeActivity()
+  const state = keepalive.getState()
+  assert.equal(state.armed, true)
+  assert.ok(state.lastWriteAt > 0)
+  assert.equal(state.blockIndex, -1)
+  assert.equal(state.deltaType, '')
+})

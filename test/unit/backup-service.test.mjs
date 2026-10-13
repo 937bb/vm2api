@@ -9,6 +9,7 @@ import { SettingsRepo } from '../../src/lib/db/repos/settings-repo.mjs'
 import { VmsRepo } from '../../src/lib/db/repos/vms-repo.mjs'
 import { BackupService, tarAvailable } from '../../src/lib/admin/backup-service.mjs'
 import { ApiKeyStore } from '../../src/lib/admin/api-keys.mjs'
+import { RequestLogStore } from '../../src/lib/admin/request-log.mjs'
 import { stopVmWatch, initVmDbSync } from '../../src/lib/vm/vm-db-sync.mjs'
 import { setVmWriteHook } from '../../src/lib/vm/vm-file.mjs'
 
@@ -132,6 +133,32 @@ test('restoreBackup rolls data back and creates pre_restore record', () => {
     ledger.every((r) => r.file_exists),
     'all ledger rows point at real files',
   )
+})
+
+test('restore drains buffered writes before closing the live database', () => {
+  const logs = new RequestLogStore({
+    db: getDb(),
+    mode: 'normal',
+    bufferedWrites: true,
+    writeFlushIntervalMs: 60_000,
+  })
+  const rec = svc.createBackup({ kind: 'manual' })
+  const ctx = logs.start({ method: 'POST', headers: {}, socket: {} }, { pathName: '/v1/responses' })
+  logs.finish(ctx, { status: 200, model: 'gpt-5.4' })
+  assert.equal(logs.snapshot().write_queue.pending, 1)
+
+  let drained = false
+  svc.onBeforeRestore(() => {
+    assert.equal(logs.flushPending(), 1)
+    drained = true
+  })
+  svc.onRestored((db) => logs.rebind(db))
+  svc.restoreBackup(rec.id)
+
+  assert.equal(drained, true)
+  assert.equal(logs.snapshot().write_queue.pending, 0)
+  assert.equal(logs.queryNormal({ include_muted: true }).total, 0, 'restored snapshot must not replay newer rows')
+  logs.stop()
 })
 
 test('restore fails when stores cannot rebind to the reopened database', () => {

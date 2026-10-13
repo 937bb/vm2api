@@ -5,7 +5,7 @@
  * resolver is used by config, admission, persistence and panel projections so
  * a value cannot silently acquire a different meaning at another boundary.
  */
-import { buildCodexUsageView } from '../protocol/codex-usage.mjs'
+import { extraToCodexSnapshot, normalizeCodexLimits } from '../protocol/codex-usage.mjs'
 
 export const OPENAI_QUOTA_DEFAULTS = Object.freeze({
   limit_5h: 1,
@@ -24,6 +24,22 @@ export const OPENAI_QUOTA_LIMITS = Object.freeze({
 })
 
 const FIELDS = Object.keys(OPENAI_QUOTA_DEFAULTS)
+const NORMALIZED_POLICIES = new WeakMap()
+
+function rememberNormalizedPolicy(policy) {
+  NORMALIZED_POLICIES.set(
+    policy,
+    FIELDS.map((key) => policy[key]),
+  )
+  return policy
+}
+
+function isRememberedPolicy(policy) {
+  const values = NORMALIZED_POLICIES.get(policy)
+  return !!values && FIELDS.every((key, index) => policy[key] === values[index])
+}
+
+rememberNormalizedPolicy(OPENAI_QUOTA_DEFAULTS)
 
 function finite(value) {
   if (value == null || value === '' || typeof value !== 'number') return null
@@ -54,13 +70,14 @@ function normalizedValue(key, value, { strict = false } = {}) {
 
 export function normalizeOpenAIQuotaPolicy(raw = {}, { strict = false } = {}) {
   const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+  if (!strict && isRememberedPolicy(source)) return source
   const out = {}
   for (const key of FIELDS) {
     if (strict && Object.prototype.hasOwnProperty.call(source, key))
       out[key] = normalizedValue(key, source[key], { strict })
     else out[key] = normalizedValue(key, source[key] ?? OPENAI_QUOTA_DEFAULTS[key], { strict: false })
   }
-  return out
+  return rememberNormalizedPolicy(out)
 }
 
 export function validateOpenAIQuotaPatch(raw = {}) {
@@ -82,25 +99,37 @@ export function mergeOpenAIQuotaPolicy(current, patch) {
   })
 }
 
-export function openAIConcurrencyOf(vm, policy = OPENAI_QUOTA_DEFAULTS) {
+function concurrencyOf(vm, policy) {
   const raw = vm?.policy?.maxConcurrency ?? vm?.max_concurrency
   const own = vm?.policy?.concurrencyOverride ?? vm?.concurrency_override ?? vm?.max_concurrency_override
   if (own !== false && Number.isInteger(raw) && raw >= 0) return raw || 2
-  return normalizeOpenAIQuotaPolicy(policy).max_concurrency
+  return policy.max_concurrency
 }
 
-export function openAIRpmOf(vm, policy = OPENAI_QUOTA_DEFAULTS) {
+export function openAIConcurrencyOf(vm, policy = OPENAI_QUOTA_DEFAULTS) {
+  return concurrencyOf(vm, normalizeOpenAIQuotaPolicy(policy))
+}
+
+function rpmOf(vm, policy) {
   const raw = vm?.policy?.maxRpm ?? vm?.max_rpm
   const own = vm?.policy?.rpmOverride ?? vm?.rpm_override ?? vm?.max_rpm_override
   if (own !== false && Number.isInteger(raw) && raw >= 0) return raw
-  return normalizeOpenAIQuotaPolicy(policy).max_rpm
+  return policy.max_rpm
 }
 
-export function openAISessionsOf(vm, policy = OPENAI_QUOTA_DEFAULTS) {
+export function openAIRpmOf(vm, policy = OPENAI_QUOTA_DEFAULTS) {
+  return rpmOf(vm, normalizeOpenAIQuotaPolicy(policy))
+}
+
+function sessionsOf(vm, policy) {
   const raw = vm?.policy?.maxSessions ?? vm?.max_sessions
   const own = vm?.policy?.sessionsOverride ?? vm?.max_sessions_override
   if (own !== false && Number.isInteger(raw) && raw >= 0) return raw
-  return normalizeOpenAIQuotaPolicy(policy).max_sessions
+  return policy.max_sessions
+}
+
+export function openAISessionsOf(vm, policy = OPENAI_QUOTA_DEFAULTS) {
+  return sessionsOf(vm, normalizeOpenAIQuotaPolicy(policy))
 }
 
 function usageFraction(value, { percent = false } = {}) {
@@ -109,18 +138,34 @@ function usageFraction(value, { percent = false } = {}) {
   return percent ? n / 100 : n
 }
 
-function resetIsLive(value, now) {
-  if (value == null || value === '') return null
-  const at = typeof value === 'number' ? value : Date.parse(value)
-  return Number.isFinite(at) ? at > now : null
+function normalizedUsagePercent(value) {
+  const ratio = usageFraction(value, { percent: true })
+  return ratio == null ? null : Math.min(1, Math.max(0, ratio))
 }
 
-export function evaluateOpenAIQuotaGate(vm, policy = OPENAI_QUOTA_DEFAULTS, now = Date.now()) {
+function resetEpoch(value) {
+  if (value == null || value === '') return null
+  const at = typeof value === 'number' ? value : Date.parse(value)
+  return Number.isFinite(at) ? at : null
+}
+
+export function evaluateOpenAIQuotaGate(vm, policy = OPENAI_QUOTA_DEFAULTS, now = Date.now(), prepared = null) {
   const effective = normalizeOpenAIQuotaPolicy(policy)
   const extra = vm?.codex?.extra || vm?.codex_extra || {}
-  const usage = Object.keys(extra).length
-    ? buildCodexUsageView(extra).quota
-    : vm?.codex_usage?.quota || vm?.codex?.usage?.quota || {}
+  const hasExtra = Object.keys(extra).length > 0
+  let usage = vm?.codex_usage?.quota || vm?.codex?.usage?.quota || {}
+  if (hasExtra) {
+    const limits =
+      prepared?.extra === extra && prepared?.limits
+        ? prepared.limits
+        : normalizeCodexLimits(extraToCodexSnapshot(extra))
+    usage = {
+      utilization_5h: normalizedUsagePercent(limits.used_5h_percent),
+      utilization_7d: normalizedUsagePercent(limits.used_7d_percent),
+      reset_5h: limits.reset_5h_at,
+      reset_7d: limits.reset_7d_at,
+    }
+  }
   let first = null
   let until = null
   for (const key of ['5h', '7d']) {
@@ -128,8 +173,8 @@ export function evaluateOpenAIQuotaGate(vm, policy = OPENAI_QUOTA_DEFAULTS, now 
     const normalized = usage[`utilization_${key}`] ?? vm?.[`utilization_${key}`]
     const used = percent == null ? usageFraction(normalized) : usageFraction(percent, { percent: true })
     const reset = extra[`codex_${key}_reset_at`] ?? usage[`reset_${key}`] ?? vm?.[`reset_${key}`]
-    if (used == null || resetIsLive(reset, now) === false || used < effective[`limit_${key}`]) continue
-    const at = typeof reset === 'number' ? reset : Date.parse(reset || '')
+    const at = resetEpoch(reset)
+    if (used == null || (at != null && at <= now) || used < effective[`limit_${key}`]) continue
     if (Number.isFinite(at) && at > now) until = until == null ? at : Math.min(until, at)
     first ||= { limited: true, reason: `quota_${key}_local`, window: key, used, limit: effective[`limit_${key}`] }
   }
@@ -141,9 +186,9 @@ export function evaluateOpenAIQuotaGate(vm, policy = OPENAI_QUOTA_DEFAULTS, now 
 export function effectiveOpenAIPolicy(vm, globalPolicy = OPENAI_QUOTA_DEFAULTS) {
   const policy = normalizeOpenAIQuotaPolicy(globalPolicy)
   return {
-    max_concurrency: openAIConcurrencyOf(vm, policy),
-    max_rpm: openAIRpmOf(vm, policy),
-    max_sessions: openAISessionsOf(vm, policy),
+    max_concurrency: concurrencyOf(vm, policy),
+    max_rpm: rpmOf(vm, policy),
+    max_sessions: sessionsOf(vm, policy),
     concurrency_override:
       vm?.policy?.concurrencyOverride === true ||
       vm?.max_concurrency_override === true ||

@@ -63,13 +63,8 @@ export function extraFromCodexHeaders(headers = {}, now = Date.now()) {
 /** Fallback park when upstream says "spent" but ships no reset clock. */
 export const CODEX_DEFAULT_PARK_MS = 60_000
 
-/**
- * Park verdict for a slot: a window at its cap with a future reset, or an
- * explicit `usage_limit_reached`, means the credential is spent until the
- * soonest window reset.
- */
-export function codexQuotaPark(extra = {}, now = Date.now()) {
-  const limits = normalizeCodexLimits(extraToCodexSnapshot(extra))
+/** Park verdict when the caller already normalized the Codex windows. */
+export function codexQuotaParkFromLimits(limits = {}, limitedUntil = null, now = Date.now()) {
   let until = null
   let liveCap = false
   for (const key of ['5h', '7d']) {
@@ -80,11 +75,21 @@ export function codexQuotaPark(extra = {}, now = Date.now()) {
     liveCap = true
     if (Number.isFinite(resetMs) && resetMs > now && (until == null || resetMs < until)) until = resetMs
   }
-  const manual = Date.parse(extra?.codex_limited_until || '')
+  const manual = Date.parse(limitedUntil || '')
   const manualLive = Number.isFinite(manual) && manual > now
   if (manualLive && (until == null || manual < until)) until = manual
   if (liveCap && until == null && !Number.isFinite(manual)) until = now + CODEX_DEFAULT_PARK_MS
   return { limited: until != null, until }
+}
+
+/**
+ * Park verdict for a slot: a window at its cap with a future reset, or an
+ * explicit `usage_limit_reached`, means the credential is spent until the
+ * soonest window reset.
+ */
+export function codexQuotaPark(extra = {}, now = Date.now()) {
+  const limits = normalizeCodexLimits(extraToCodexSnapshot(extra))
+  return codexQuotaParkFromLimits(limits, extra?.codex_limited_until, now)
 }
 
 function lowerHeaders(headers) {

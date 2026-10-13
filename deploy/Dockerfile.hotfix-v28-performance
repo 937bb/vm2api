@@ -1,0 +1,9 @@
+FROM vm2api-local:v1.3.153-hotfix-v27-sticky-cache
+
+COPY src/lib/pool/codex-slot-pool.mjs /opt/vm2api/src/lib/pool/codex-slot-pool.mjs
+COPY src/lib/pool/openai-account-runtime.mjs /opt/vm2api/src/lib/pool/openai-account-runtime.mjs
+COPY src/lib/pool/openai-quota-policy.mjs /opt/vm2api/src/lib/pool/openai-quota-policy.mjs
+COPY src/lib/protocol/codex-usage.mjs /opt/vm2api/src/lib/protocol/codex-usage.mjs
+COPY src/lib/protocol/handle-codex.mjs /opt/vm2api/src/lib/protocol/handle-codex.mjs
+COPY src/lib/vm/vm-registry.mjs /opt/vm2api/src/lib/vm/vm-registry.mjs
+COPY src/server.mjs /opt/vm2api/src/server.mjs

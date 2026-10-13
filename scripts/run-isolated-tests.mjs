@@ -14,7 +14,7 @@ if (!dir) {
 }
 
 const files = readdirSync(dir)
-  .filter((name) => name.endsWith(suffix))
+  .filter((name) => !name.startsWith('._') && name.endsWith(suffix))
   .sort()
   .map((name) => path.join(dir, name))
 

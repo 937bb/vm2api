@@ -47,6 +47,7 @@ import { isCodexVm } from '../vm/vm-kind.mjs'
 import { syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { wakeOpenAIWaiter } from '../pool/openai-account-runtime.mjs'
 import { normalizeVmConfig } from '../vm/machine-spec.mjs'
+import { syncCodexAccountScheduling } from '../vm/codex-slot.mjs'
 
 export function createRoutingRuntime(ctx) {
   const getRouting = () => (typeof ctx.getRoutingConfig === 'function' ? ctx.getRoutingConfig() : ctx.routingConfig)
@@ -62,6 +63,7 @@ export function createRoutingRuntime(ctx) {
   const getHealth = () => (typeof ctx.getHealthMonitor === 'function' ? ctx.getHealthMonitor() : ctx.healthMonitor)
   const getUsage = () => ctx.usageProbeMonitor
   const getNotify = () => ctx.notifyMonitor
+  const getAttempts = () => (typeof ctx.getAttemptsRepo === 'function' ? ctx.getAttemptsRepo() : ctx.attemptsRepo)
   const setRuntimeRepo = (next) => {
     if (typeof ctx.setRuntimeRepo === 'function') ctx.setRuntimeRepo(next)
     else ctx.runtimeRepo = next
@@ -83,7 +85,8 @@ export function createRoutingRuntime(ctx) {
     vm.policy = { ...(vm.policy || {}), maxConcurrency: value, concurrencyOverride: override }
     vm.updated_at = new Date().toISOString()
     atomicWriteJson(vmPath, vm, { mode: 0o600 })
-    if (!isCodexVm(vm)) ctx.accountQuota.setMaxConcurrency(vm.claude?.account_uuid || vm.id, value, { override })
+    if (isCodexVm(vm)) syncCodexAccountScheduling(ctx.cfg.paths.project, vm)
+    else ctx.accountQuota.setMaxConcurrency(vm.claude?.account_uuid || vm.id, value, { override })
     return vm
   }
 
@@ -95,7 +98,8 @@ export function createRoutingRuntime(ctx) {
     vm.policy = { ...(vm.policy || {}), maxRpm: value, rpmOverride: override }
     vm.updated_at = new Date().toISOString()
     atomicWriteJson(vmPath, vm, { mode: 0o600 })
-    if (!isCodexVm(vm) && vm.claude) ctx.accountQuota.setMaxRpm(vm.claude.account_uuid || vm.id, value, { override })
+    if (isCodexVm(vm)) syncCodexAccountScheduling(ctx.cfg.paths.project, vm)
+    else if (vm.claude) ctx.accountQuota.setMaxRpm(vm.claude.account_uuid || vm.id, value, { override })
     return vm
   }
 
@@ -613,7 +617,12 @@ export function createRoutingRuntime(ctx) {
   function initPoolRuntime() {
     const routingConfig = getRouting()
     const runtimeRepo = new AccountRuntimeRepo()
-    const attemptsRepo = new RequestAttemptsRepo()
+    try {
+      getAttempts()?.stop?.()
+    } catch {}
+    const attemptsRepo = new RequestAttemptsRepo(undefined, {
+      bufferedWrites: process.env.KIN_DB_WRITE_BUFFER !== '0',
+    })
     setRuntimeRepo(runtimeRepo)
     setAttemptsRepo(attemptsRepo)
     ctx.accountQuota.attachRuntimeRepo(runtimeRepo)

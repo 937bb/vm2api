@@ -1,0 +1,12 @@
+FROM vm2api-local:v1.3.148-hotfix-503-v24-dashboard-count
+
+COPY src/server.mjs /opt/vm2api/src/server.mjs
+COPY src/lib/http/client-error.mjs /opt/vm2api/src/lib/http/client-error.mjs
+COPY src/lib/pool/openai-account-runtime.mjs /opt/vm2api/src/lib/pool/openai-account-runtime.mjs
+COPY src/lib/protocol/handle-protocol.mjs /opt/vm2api/src/lib/protocol/handle-protocol.mjs
+COPY src/lib/protocol/handle-codex.mjs /opt/vm2api/src/lib/protocol/handle-codex.mjs
+COPY src/lib/protocol/stream-backpressure.mjs /opt/vm2api/src/lib/protocol/stream-backpressure.mjs
+COPY src/lib/transport/codex-kernel-client.mjs /opt/vm2api/src/lib/transport/codex-kernel-client.mjs
+COPY src/lib/transport/codex-kernel-supervisor.mjs /opt/vm2api/src/lib/transport/codex-kernel-supervisor.mjs
+COPY src/lib/transport/go-worker-client.mjs /opt/vm2api/src/lib/transport/go-worker-client.mjs
+COPY src/lib/vm/slot-runtime.mjs /opt/vm2api/src/lib/vm/slot-runtime.mjs

@@ -1,0 +1,3 @@
+FROM vm2api-local:v1.3.148-hotfix-503-v14
+
+COPY dist /opt/vm2api/web/dist

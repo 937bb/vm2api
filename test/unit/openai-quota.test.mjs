@@ -19,6 +19,7 @@ import {
   evaluateOpenAIQuotaGate,
   effectiveOpenAIPolicy,
   mergeOpenAIQuotaPolicy,
+  normalizeOpenAIQuotaPolicy,
 } from '../../src/lib/pool/openai-quota-policy.mjs'
 
 test('OpenAI local quota gate blocks equality without inventing a reset and recovers after reset', () => {
@@ -65,6 +66,15 @@ test('OpenAI policy pins and null-reset inheritance remain platform-local', () =
   })
   assert.equal(effectiveOpenAIPolicy({ policy: { maxSessions: 0, sessionsOverride: false } }, global).max_sessions, 4)
   assert.equal(effectiveOpenAIPolicy({ policy: { maxSessions: 6, sessionsOverride: true } }, global).max_sessions, 6)
+})
+
+test('normalized OpenAI policy is reused until a caller mutates it', () => {
+  const policy = normalizeOpenAIQuotaPolicy({ max_concurrency: 8 })
+  assert.equal(normalizeOpenAIQuotaPolicy(policy), policy)
+  policy.max_concurrency = 999
+  const repaired = normalizeOpenAIQuotaPolicy(policy)
+  assert.notEqual(repaired, policy)
+  assert.equal(repaired.max_concurrency, 256)
 })
 
 test('extraFromRateLimit maps shorter window to 5h', () => {

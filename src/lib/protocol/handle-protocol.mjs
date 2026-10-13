@@ -116,6 +116,7 @@ import {
   isClaudeCodeFamilyRequest,
 } from '../identity/claude-code-only.mjs'
 import { createDownstreamKeepalive } from './stream-keepalive.mjs'
+import { writeKeepaliveIfWritable, writeWithBackpressure } from './stream-backpressure.mjs'
 import { createAnthropicStreamTracker, isRecoverableTruncation } from './stream-truncation.mjs'
 import {
   hidePersonaUsageInSseLine,
@@ -168,6 +169,8 @@ export function createHandleProtocol(deps) {
     typeof deps.getHealthMonitor === 'function' ? deps.getHealthMonitor() : deps.healthMonitor
   const getFailoverRunner = () =>
     typeof deps.getFailoverRunner === 'function' ? deps.getFailoverRunner() : deps.failoverRunner
+  const getAttemptsRepo = () =>
+    typeof deps.getAttemptsRepo === 'function' ? deps.getAttemptsRepo() : deps.attemptsRepo
   function responseClosed(res) {
     return !!(res?.destroyed || res?.writableEnded || res?.closed)
   }
@@ -689,6 +692,9 @@ export function createHandleProtocol(deps) {
             },
           },
           projectRoot: cfg.paths.project,
+          upstreamTimeoutMs: cfg.limits.upstream_timeout_ms,
+          requestId: logCtx.request_id,
+          attemptsRepo: getAttemptsRepo(),
           captureOutbound: logCtx.capture_outbound === true,
           ...codexSticky,
         })
@@ -705,6 +711,9 @@ export function createHandleProtocol(deps) {
         writeSSEHeaders,
         routing,
         projectRoot: cfg.paths.project,
+        upstreamTimeoutMs: cfg.limits.upstream_timeout_ms,
+        requestId: logCtx.request_id,
+        attemptsRepo: getAttemptsRepo(),
         captureOutbound: logCtx.capture_outbound === true,
         ...codexSticky,
       })
@@ -988,7 +997,9 @@ export function createHandleProtocol(deps) {
           if (!isClientCancelledResult(result)) stats.errors++
           return sendMapped(res, mapped)
         }
-        if (result?.ok && protocol !== 'anthropic.messages') res.write('data: [DONE]\n\n')
+        if (result?.ok && protocol !== 'anthropic.messages') {
+          await writeWithBackpressure(res, 'data: [DONE]\n\n', clientAbort.signal)
+        }
         return res.end()
       }
       if (!result?.ok) {
@@ -1295,11 +1306,7 @@ export function createHandleProtocol(deps) {
             intervalMs: streamKeepaliveMs,
             userAgent: req.headers['user-agent'] || req.headers['User-Agent'] || '',
             protocol,
-            write: (chunk) => {
-              if (res.writableEnded || res.destroyed) return
-              if (!res.headersSent) writeSSEHeaders(res)
-              res.write(chunk)
-            },
+            write: (chunk) => writeKeepaliveIfWritable(res, chunk, writeSSEHeaders),
           })
           keepalive.start()
           try {
@@ -1333,25 +1340,29 @@ export function createHandleProtocol(deps) {
                 if (protocol === 'anthropic.messages') {
                   streamTracker?.observe(line)
                   if (!res.headersSent) writeSSEHeaders(res)
-                  res.write(String(line).endsWith('\n') ? String(line) : String(line) + '\n')
+                  await writeWithBackpressure(
+                    res,
+                    String(line).endsWith('\n') ? String(line) : String(line) + '\n',
+                    signal,
+                  )
                   return
                 }
-                const writeChunks = (chunks) => {
+                const writeChunks = async (chunks) => {
                   if (!chunks.length) return
                   if (!res.headersSent) writeSSEHeaders(res)
                   for (const chunk of chunks) {
-                    res.write(`data: ${JSON.stringify(chunk)}\n\n`)
+                    if (!(await writeWithBackpressure(res, `data: ${JSON.stringify(chunk)}\n\n`, signal))) break
                   }
                 }
                 if (protocol === 'openai.chat') {
-                  writeChunks(claudeSSELineToOpenAIChatChunks(line, state))
+                  await writeChunks(claudeSSELineToOpenAIChatChunks(line, state))
                   return
                 }
                 if (protocol === 'openai.completions') {
-                  writeChunks(claudeSSELineToOpenAICompletionChunks(line, state))
+                  await writeChunks(claudeSSELineToOpenAICompletionChunks(line, state))
                   return
                 }
-                writeChunks(claudeSSELineToResponsesEvents(line, state))
+                await writeChunks(claudeSSELineToResponsesEvents(line, state))
               },
             })
           } finally {
@@ -1445,14 +1456,14 @@ export function createHandleProtocol(deps) {
         return sendMapped(res, mapped)
       }
       if (result?.ok && protocol !== 'anthropic.messages') {
-        res.write('data: [DONE]\n\n')
+        await writeWithBackpressure(res, 'data: [DONE]\n\n', clientAbort.signal)
       }
       if (!result?.ok) {
         stats.errors++
         logBag.error_code = result?.body?.error?.code || 'stream_incomplete'
         logBag.error_message = result?.body?.error?.message || 'Stream did not reach a verified terminal state'
         const closing = isRecoverableTruncation(result) && !res.writableEnded ? streamTracker?.closingEvents() : null
-        if (closing) res.write(closing)
+        if (closing) await writeWithBackpressure(res, closing, clientAbort.signal)
       }
       rememberRefusal({ inbound, body: ctx.body, headers: req.headers, result, logBag, requestId: logCtx.request_id })
       return res.end()

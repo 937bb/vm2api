@@ -11,6 +11,7 @@ import {
   workerHealth,
   usageFromSseEvent,
   isDownstreamCommitEvent,
+  isUpstreamAcceptedEvent,
   restoreUncommittedHop,
   semanticStatusForStreamError,
 } from '../../src/lib/transport/go-worker-client.mjs'
@@ -99,6 +100,21 @@ test('semanticStatusForStreamError reads outer Codex status 500 instead of defau
       error: { type: 'server_error', code: 'server_error', message: 'no explicit status' },
     }),
     502,
+  )
+})
+
+test('semanticStatusForStreamError restores a kernel-flattened content policy error to 403', () => {
+  assert.equal(
+    semanticStatusForStreamError({
+      type: 'error',
+      status: 502,
+      error: {
+        type: 'api_error',
+        code: 'cyber_policy',
+        message: 'This content was flagged for possible cybersecurity risk.',
+      },
+    }),
+    403,
   )
 })
 
@@ -386,6 +402,122 @@ unixTest('streamGoWorker accepts message_stop before delayed EOF', async () => {
     assert.equal(result.terminalState, 'verified')
     assert.equal(result.committed, true)
     assert.ok(lines.some((line) => line.includes('message_stop')))
+  } finally {
+    await fx.close()
+  }
+})
+
+unixTest('streamGoWorker exposes the kernel HTTP status before consuming the stream', async () => {
+  const fx = await fixture((_req, res) => {
+    res.statusCode = 503
+    res.setHeader('content-type', 'application/json')
+    res.end(JSON.stringify({ error: { code: 'no_capacity', message: 'credential busy' } }))
+  })
+  try {
+    const responses = []
+    const result = await streamGoWorker({
+      exec: fx.exec,
+      body: { model: 'claude-test', stream: true, messages: [{ role: 'user', content: 'hi' }] },
+      onResponse: (response) => responses.push(response),
+    })
+    assert.equal(result.status, 503)
+    assert.equal(result.committed, false)
+    assert.equal(responses.length, 1)
+    assert.equal(responses[0].status, 503)
+  } finally {
+    await fx.close()
+  }
+})
+
+unixTest('kernel metadata keeps the first-event deadline until OpenAI accepts the turn', async () => {
+  const fx = await fixture(async (_req, res) => {
+    res.setHeader('content-type', 'text/event-stream')
+    writeData(res, { type: 'response_headers', headers: { 'x-request-id': 'upstream-pending' } })
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    writeData(res, { type: 'response.created', response: { id: 'resp_after_metadata' } })
+    writeData(res, { type: 'response.completed', response: { id: 'resp_after_metadata' } })
+    res.end()
+  })
+  try {
+    const result = await streamGoWorker({
+      exec: fx.exec,
+      body: { model: 'gpt-5.5', stream: true, input: [] },
+      timeoutMs: 250,
+      idleTimeoutMs: 25,
+      sseEventMode: 'responses-passthrough',
+      onEvent: () => {},
+    })
+    assert.equal(result.ok, true)
+    assert.equal(result.terminalState, 'verified')
+  } finally {
+    await fx.close()
+  }
+})
+
+unixTest('idle timeout starts after a real upstream lifecycle event', async () => {
+  const fx = await fixture(async (_req, res) => {
+    res.setHeader('content-type', 'text/event-stream')
+    writeData(res, { type: 'response.created', response: { id: 'resp_idle' } })
+    await new Promise((resolve) => setTimeout(resolve, 1200))
+    res.end()
+  })
+  try {
+    const result = await streamGoWorker({
+      exec: fx.exec,
+      body: { model: 'gpt-5.5', stream: true, input: [] },
+      timeoutMs: 250,
+      idleTimeoutMs: 100,
+      sseEventMode: 'responses-passthrough',
+      onEvent: () => {},
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.transportError, true)
+    assert.equal(result.body.error.code, 'worker_timeout')
+    assert.match(result.body.error.message, /idle timeout after 100ms/)
+  } finally {
+    await fx.close()
+  }
+})
+
+unixTest('overall stream deadline cannot be refreshed by kernel retry events', async () => {
+  let hopId = null
+  let cancelled = null
+  const sawCancel = new Promise((resolve) => {
+    cancelled = resolve
+  })
+  const fx = await fixture(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    if (req.url === '/internal/v1/cancel') {
+      res.setHeader('content-type', 'application/json')
+      res.end('{"ok":true,"cancelled":true}')
+      cancelled(payload.request_id)
+      return
+    }
+    hopId = payload.request_id
+    res.setHeader('content-type', 'text/event-stream')
+    const ticker = setInterval(() => {
+      writeData(res, { type: 'response.created', response: { id: 'retrying' } })
+    }, 10)
+    res.once('close', () => clearInterval(ticker))
+  })
+  try {
+    const startedAt = Date.now()
+    const result = await streamGoWorker({
+      exec: fx.exec,
+      body: { model: 'gpt-5.5', stream: true, input: [] },
+      timeoutMs: 500,
+      idleTimeoutMs: 500,
+      overallTimeoutMs: 80,
+      sseEventMode: 'responses-passthrough',
+      onEvent: () => {},
+    })
+    assert.equal(result.status, 504)
+    assert.equal(result.body.error.code, 'kernel_retry_deadline')
+    assert.equal(result.transportError, true)
+    assert.ok(Date.now() - startedAt < 500)
+    assert.equal(await sawCancel, hopId)
   } finally {
     await fx.close()
   }
@@ -916,15 +1048,107 @@ unixTest('streamGoWorker merges SSE cache details into a totals-only usage trail
     res.end()
   })
   try {
+    let completedEvent = null
     const result = await streamGoWorker({
       exec: fx.exec,
       body: { model: 'gpt-5.4', stream: true, input: [] },
-      onEvent: () => {},
+      onEvent: (_line, event) => {
+        if (event?.type === 'response.completed') completedEvent = event
+      },
     })
+    assert.equal(result.ok, true)
+    assert.equal(result.terminalState, 'verified')
+    assert.equal(completedEvent?.response?.id, 'resp_1')
     assert.equal(result.usage.input_tokens, 120)
     assert.equal(result.usage.output_tokens, 9)
     assert.equal(result.usage.input_tokens_details.cached_tokens, 8)
     assert.equal(extractOpenaiUsage(result.usage).cached_tokens, 8)
+  } finally {
+    await fx.close()
+  }
+})
+
+unixTest('Responses passthrough uses lightweight delta events and still parses terminal usage', async () => {
+  const delta = 'x'.repeat(32 * 1024)
+  const fx = await fixture((req, res) => {
+    res.setHeader('content-type', 'text/event-stream')
+    writeData(res, { type: 'response.created', response: { id: 'resp_fast', model: 'gpt-5.4' } })
+    writeData(res, { type: 'response.output_text.delta', delta })
+    writeData(res, {
+      type: 'response.completed',
+      response: { id: 'resp_fast', model: 'gpt-5.4', usage: { input_tokens: 50, output_tokens: 4 } },
+    })
+    res.end()
+  })
+  try {
+    let lightweightDelta = null
+    let completed = null
+    let rawDelta = ''
+    const result = await streamGoWorker({
+      exec: fx.exec,
+      body: { model: 'gpt-5.4', stream: true, input: [] },
+      sseEventMode: 'responses-passthrough',
+      onEvent: (line, event) => {
+        if (event?.type === 'response.output_text.delta') {
+          lightweightDelta = event
+          rawDelta = line
+        }
+        if (event?.type === 'response.completed') completed = event
+      },
+    })
+    assert.equal(result.ok, true)
+    assert.deepEqual(lightweightDelta, { type: 'response.output_text.delta', delta: '1' })
+    assert.match(rawDelta, /"delta":"x+/)
+    assert.equal(completed?.response?.id, 'resp_fast')
+    assert.equal(result.usage.input_tokens, 50)
+    assert.equal(result.usage.output_tokens, 4)
+    assert.ok(result.ttftMs != null && result.ttftMs >= 0)
+  } finally {
+    await fx.close()
+  }
+})
+
+unixTest('Responses passthrough batches complete SSE lines from one socket chunk', async () => {
+  const frames = [
+    'event: response',
+    'data: {"type":"response.created","response":{"id":"resp_batch"}}',
+    '',
+    'event: response',
+    'data: {"type":"response.output_text.delta","delta":"hello"}',
+    '',
+    'event: response',
+    'data: {"type":"response.completed","response":{"id":"resp_batch","usage":{"output_tokens":1}}}',
+    '',
+    '',
+  ].join('\n')
+  const fx = await fixture((req, res) => {
+    res.setHeader('content-type', 'text/event-stream')
+    res.end(frames)
+  })
+  try {
+    const batches = []
+    const result = await streamGoWorker({
+      exec: fx.exec,
+      body: { model: 'gpt-5.4', stream: true, input: [] },
+      sseEventMode: 'responses-passthrough',
+      onEvent: () => assert.fail('batch mode must not also call the per-line callback'),
+      onEventBatch: (entries) => batches.push(entries),
+    })
+    const entries = batches.flat()
+    assert.equal(result.ok, true)
+    assert.equal(batches.length, 1)
+    assert.deepEqual(
+      entries.map((entry) => entry.line),
+      frames.split('\n').slice(0, -1),
+    )
+    assert.deepEqual(
+      entries.filter((entry) => entry.event).map((entry) => entry.event.type),
+      ['response.created', 'response.output_text.delta', 'response.completed'],
+    )
+    assert.deepEqual(entries.find((entry) => entry.event?.type === 'response.output_text.delta').event, {
+      type: 'response.output_text.delta',
+      delta: '1',
+    })
   } finally {
     await fx.close()
   }
@@ -947,6 +1171,48 @@ test('terminal metadata is not a downstream commit', () => {
     }),
     true,
   )
+})
+
+test('only a real upstream lifecycle frame accepts a streamed request', () => {
+  assert.equal(isUpstreamAcceptedEvent({ type: 'error', error: { message: 'rejected' } }), false)
+  assert.equal(isUpstreamAcceptedEvent({ type: 'response_headers', headers: {} }), false)
+  assert.equal(isUpstreamAcceptedEvent({ type: 'response.created', response: { id: 'resp_1' } }), true)
+  assert.equal(isDownstreamCommitEvent({ type: 'response.created', response: { id: 'resp_1' } }), false)
+  assert.equal(isUpstreamAcceptedEvent({ type: 'message_start', message: {} }), false)
+})
+
+unixTest('streamGoWorker keeps response.created uncommitted when the next event is a server error', async () => {
+  const fx = await fixture((req, res) => {
+    res.setHeader('content-type', 'text/event-stream')
+    writeData(res, { type: 'response.created', response: { id: 'resp_rejected' } })
+    writeData(res, {
+      type: 'error',
+      status: 500,
+      error: { type: 'server_error', code: 'server_error', message: 'Upstream rejected the response' },
+    })
+    res.end()
+  })
+  try {
+    const lines = []
+    let commits = 0
+    const result = await streamGoWorker({
+      exec: fx.exec,
+      body: { model: 'gpt-5.5', stream: true, input: [] },
+      sseEventMode: 'responses-passthrough',
+      onCommit: () => {
+        commits += 1
+      },
+      onEvent: (line) => lines.push(line),
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.status, 500)
+    assert.equal(result.committed, false)
+    assert.equal(result.body.error.code, 'server_error')
+    assert.equal(commits, 0)
+    assert.deepEqual(lines, [])
+  } finally {
+    await fx.close()
+  }
 })
 
 unixTest('streamGoWorker assembles text+stop_reason even without message_stop', async () => {

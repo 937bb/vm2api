@@ -105,19 +105,45 @@ export class ApiKeysRepo {
     this._delete = db.prepare('DELETE FROM api_keys WHERE id = ?')
     this._recordUsage = db.prepare(`
       UPDATE api_keys SET
-        requests = requests + 1,
-        quota_requests_used = quota_requests_used + 1,
-        tokens_in = tokens_in + ?,
-        tokens_out = tokens_out + ?,
-        cache_read_tokens = COALESCE(cache_read_tokens, 0) + ?,
-        cache_creation_tokens = COALESCE(cache_creation_tokens, 0) + ?,
-        quota_used = quota_used + ?,
-        usage_5h = ?, window_5h_start = ?,
-        usage_1d = ?, window_1d_start = ?,
-        usage_7d = ?, window_7d_start = ?,
-        last_used_at = ?,
-        updated_at = ?
-      WHERE id = ?
+        requests = COALESCE(requests, 0) + 1,
+        quota_requests_used = COALESCE(quota_requests_used, 0) + 1,
+        tokens_in = COALESCE(tokens_in, 0) + ?1,
+        tokens_out = COALESCE(tokens_out, 0) + ?2,
+        cache_read_tokens = COALESCE(cache_read_tokens, 0) + ?3,
+        cache_creation_tokens = COALESCE(cache_creation_tokens, 0) + ?4,
+        quota_used = COALESCE(quota_used, 0) + ?5,
+        status = CASE
+          WHEN status = 'active' AND quota > 0 AND COALESCE(quota_used, 0) + ?5 >= quota THEN 'quota_exhausted'
+          ELSE status
+        END,
+        usage_5h = CASE
+          WHEN window_5h_start IS NULL OR window_5h_start <= ?6 THEN ?5
+          ELSE COALESCE(usage_5h, 0) + ?5
+        END,
+        window_5h_start = CASE
+          WHEN window_5h_start IS NULL OR window_5h_start <= ?6 THEN ?9
+          ELSE window_5h_start
+        END,
+        usage_1d = CASE
+          WHEN window_1d_start IS NULL OR window_1d_start <= ?7 THEN ?5
+          ELSE COALESCE(usage_1d, 0) + ?5
+        END,
+        window_1d_start = CASE
+          WHEN window_1d_start IS NULL OR window_1d_start <= ?7 THEN ?9
+          ELSE window_1d_start
+        END,
+        usage_7d = CASE
+          WHEN window_7d_start IS NULL OR window_7d_start <= ?8 THEN ?5
+          ELSE COALESCE(usage_7d, 0) + ?5
+        END,
+        window_7d_start = CASE
+          WHEN window_7d_start IS NULL OR window_7d_start <= ?8 THEN ?9
+          ELSE window_7d_start
+        END,
+        last_used_at = ?9,
+        updated_at = ?9
+      WHERE id = ?10 AND deleted_at IS NULL
+      RETURNING *
     `)
   }
 
@@ -155,42 +181,24 @@ export class ApiKeysRepo {
     return info.changes > 0
   }
 
-  /**
-   * Sub2api APIKey window semantics: a window opens at first spend; once
-   * now - start >= size the window resets (usage=cost, start=now).
-   */
-  _rollWindow(rec, key, cost, nowMs) {
-    const start = rec[key.start] ? Date.parse(rec[key.start]) : NaN
-    if (!Number.isFinite(start) || nowMs - start >= key.ms) {
-      return { usage: cost, start: new Date(nowMs).toISOString() }
-    }
-    return { usage: (Number(rec[key.usage]) || 0) + cost, start: rec[key.start] }
-  }
-
   recordUsage(id, { tokens_in = 0, tokens_out = 0, cache_read_tokens = 0, cache_creation_tokens = 0, cost = 0 } = {}) {
-    const rec = this.getById(id)
-    if (!rec) return null
     const nowMs = Date.now()
     const now = new Date(nowMs).toISOString()
     const usd = Number(cost) || 0
-    const w = WINDOWS.map((win) => this._rollWindow(rec, win, usd, nowMs))
-    this._recordUsage.run(
+    const cutoffs = WINDOWS.map((window) => new Date(nowMs - window.ms).toISOString())
+    const row = this._recordUsage.get(
       Number(tokens_in) || 0,
       Number(tokens_out) || 0,
       Number(cache_read_tokens) || 0,
       Number(cache_creation_tokens) || 0,
       usd,
-      w[0].usage,
-      w[0].start,
-      w[1].usage,
-      w[1].start,
-      w[2].usage,
-      w[2].start,
-      now,
+      cutoffs[0],
+      cutoffs[1],
+      cutoffs[2],
       now,
       id,
     )
-    return this.getById(id)
+    return rowToRec(row)
   }
 
   count() {

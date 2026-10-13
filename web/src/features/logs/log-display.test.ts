@@ -1,6 +1,7 @@
-import type { ProviderChainItem } from '@/types/panel-usage-logs'
+import type { ProviderChainItem, UsageLogRow } from '@/types/panel-usage-logs'
 import { describe, expect, it } from 'vitest'
 import {
+  actualCacheRate,
   cacheCostSplit,
   cacheWriteSplit,
   chainItemStatus,
@@ -80,6 +81,34 @@ describe('cache TTL split', () => {
   it('derives the per-million unit price', () => {
     expect(unitPricePerMillion(0.003, 1000)).toBe('3.00')
     expect(unitPricePerMillion(0.003, 0)).toBeNull()
+  })
+
+  it('uses inclusive OpenAI input and disjoint Anthropic input', () => {
+    const tokens = {
+      inputTokens: 100,
+      cacheReadInputTokens: 60,
+      cacheCreationInputTokens: 10,
+    }
+    expect(
+      actualCacheRate({ ...tokens, via: 'codex-kernel' } as UsageLogRow)
+    ).toBe(0.6)
+    expect(
+      actualCacheRate({ ...tokens, via: 'go-worker' } as UsageLogRow)
+    ).toBeCloseTo(60 / 170)
+  })
+
+  it('keeps converted non-streaming Anthropic usage disjoint', () => {
+    expect(
+      actualCacheRate({
+        inputTokens: 40,
+        cacheReadInputTokens: 60,
+        cacheCreationInputTokens: 0,
+        via: 'api-kernel',
+        protocol: 'anthropic.messages',
+        stream: false,
+        model: 'gpt-5.4',
+      } as UsageLogRow)
+    ).toBe(0.6)
   })
 })
 

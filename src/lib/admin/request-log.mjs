@@ -18,7 +18,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { redactSecrets } from '../core/security.mjs'
-import { resolveStoreDb } from '../db/database.mjs'
+import { resolveStoreDb, withTransaction } from '../db/database.mjs'
+import { BufferedWriteQueue } from '../db/buffered-write-queue.mjs'
 import { UsageLogsRepo } from '../db/repos/usage-logs-repo.mjs'
 import { classifyRequestError, resolveMutedErrorClasses } from './error-class.mjs'
 import { costColumnsFromUsage, normalizeUsage } from './pricing.mjs'
@@ -37,7 +38,14 @@ const MODES = new Set(['off', 'normal', 'debug'])
 const DEFAULT_RETAIN_DAYS = 7
 const DEFAULT_DEBUG_RETAIN_DAYS = 3
 const DEFAULT_MAX_MB = 2048
+const DEFAULT_DEBUG_BODY_CHARS = 32 * 1024
 const CLEANUP_INTERVAL_MS = 10 * 60 * 1000
+// Billing scans grow with retained usage. One minute is fresh enough for
+// the panel while preventing dashboard/list/usage polling from monopolizing
+// the inference event loop.
+const BILLING_CACHE_MS = 60_000
+const TOTALS_CACHE_MS = 60_000
+const WINDOW_STATS_CACHE_MS = 5_000
 
 function clampInt(value, min, max, fallback) {
   if (value == null || value === '') return fallback
@@ -323,18 +331,22 @@ export class RequestLogStore {
     dataDir,
     db,
     mode = process.env.KIN_REQUEST_LOG_MODE || 'normal',
-    maxDebugBodyChars = Number(process.env.KIN_REQUEST_LOG_DEBUG_CHARS || 200000),
+    maxDebugBodyChars = Number(process.env.KIN_REQUEST_LOG_DEBUG_CHARS || DEFAULT_DEBUG_BODY_CHARS),
     retainDays = Number(process.env.KIN_REQUEST_LOG_RETAIN_DAYS || DEFAULT_RETAIN_DAYS),
     debugRetainDays = Number(process.env.KIN_REQUEST_LOG_DEBUG_RETAIN_DAYS || DEFAULT_DEBUG_RETAIN_DAYS),
     maxMb = Number(process.env.KIN_REQUEST_LOG_MAX_MB || DEFAULT_MAX_MB),
     jsonlMirror = process.env.KIN_REQUEST_LOG_JSONL === '1',
+    bufferedWrites = false,
+    writeBatchSize = Number(process.env.KIN_DB_WRITE_BATCH_SIZE || 256),
+    writeQueueSize = Number(process.env.KIN_DB_WRITE_QUEUE_SIZE || 16_384),
+    writeFlushIntervalMs = Number(process.env.KIN_DB_WRITE_FLUSH_MS || 10),
   } = {}) {
     this.dataDir = dataDir || path.join(process.cwd(), 'data')
     this.db = resolveStoreDb({ db, dataDir: this.dataDir })
     this.repo = new UsageLogsRepo(this.db)
     this.root = path.join(this.dataDir, 'request-logs')
     this.mode = MODES.has(String(mode).toLowerCase()) ? String(mode).toLowerCase() : 'normal'
-    this.maxDebugBodyChars = Number.isFinite(maxDebugBodyChars) ? maxDebugBodyChars : 200000
+    this.maxDebugBodyChars = Number.isFinite(maxDebugBodyChars) ? maxDebugBodyChars : DEFAULT_DEBUG_BODY_CHARS
     this.retainDays = Number.isFinite(retainDays) && retainDays > 0 ? retainDays : DEFAULT_RETAIN_DAYS
     this.debugRetainDays =
       Number.isFinite(debugRetainDays) && debugRetainDays > 0 ? debugRetainDays : DEFAULT_DEBUG_RETAIN_DAYS
@@ -345,6 +357,27 @@ export class RequestLogStore {
     this._mem = [] // recent normal summaries for panel hot path
     this._memMax = 200
     this._cleanupTimer = null
+    this._billingCache = new Map()
+    this._totalsCache = null
+    this._windowStatsCache = new Map()
+    this._writeQueue = bufferedWrites
+      ? new BufferedWriteQueue({
+          batchSize: writeBatchSize,
+          maxPending: writeQueueSize,
+          flushIntervalMs: writeFlushIntervalMs,
+          flush: (entries) => this._persistWriteBatch(entries),
+          onError: (error, count) => {
+            console.error(
+              JSON.stringify({
+                event: 'request_log_write_failed',
+                count,
+                code: error?.code || null,
+                message: String(error?.message || error).slice(0, 200),
+              }),
+            )
+          },
+        })
+      : null
   }
 
   setConfig({ mode, retainDays, debugRetainDays, maxMb, mutedErrorClasses } = {}) {
@@ -373,14 +406,52 @@ export class RequestLogStore {
 
   /** Kept for API compat + post-restore hook (state lives in DB). */
   reload() {
+    this.flushPending()
     this._mem = []
+    this._billingCache.clear()
+    this._totalsCache = null
+    this._windowStatsCache.clear()
   }
 
   /** Re-bind to a fresh DB connection (after backup restore). */
   rebind(db) {
+    // Queued writes belong to the currently bound database. Drain them before
+    // swapping repositories so a restore cannot replay old rows into the new DB.
+    this.flushPending()
     this.db = db
     this.repo = new UsageLogsRepo(db)
     this._mem = []
+    this._billingCache.clear()
+    this._totalsCache = null
+    this._windowStatsCache.clear()
+  }
+
+  _persistWriteBatch(entries) {
+    withTransaction(this.db, () => {
+      for (const entry of entries) {
+        this.repo.insertSummaryIfAbsent(entry.summary)
+        if (entry.debug) {
+          this.repo.insertDebug(entry.summary.request_id || entry.summary.id, entry.summary.ts, entry.debug)
+        }
+      }
+    })
+  }
+
+  _persistWrite(entry) {
+    if (this._writeQueue) {
+      this._writeQueue.enqueue(entry)
+      return
+    }
+    this._persistWriteBatch([entry])
+  }
+
+  flushPending() {
+    return this._writeQueue?.flush() || 0
+  }
+
+  stop() {
+    this.stopCleanupScheduler()
+    return this._writeQueue?.close() || 0
   }
 
   start(req, { protocol = null, pathName = null } = {}) {
@@ -505,7 +576,7 @@ export class RequestLogStore {
       intercept: extra.intercept ? String(extra.intercept).slice(0, 400) : null,
       // sub2api ownership + billing columns
       user_id: extra.user_id ?? null,
-      vm_owner_user_id: this.repo.vmOwnerOf(extra.vm_id),
+      vm_owner_user_id: extra.vm_id ? this.repo.vmOwnerOf(String(extra.vm_id)) : null,
       group_id: extra.group_id ?? 1,
       rate_multiplier: Number.isFinite(Number(extra.rate_multiplier)) ? Number(extra.rate_multiplier) : 1,
       ...costColumnsFromUsage(
@@ -529,15 +600,13 @@ export class RequestLogStore {
     const classified = classifyRequestError(summary)
     if (classified?.error_class) summary.error_class = classified.error_class
 
-    try {
-      this.repo.insertSummaryIfAbsent(summary)
-    } catch {}
     if (this.jsonlMirror) this._appendJsonl(summary)
     this._mem.push(summary)
     if (this._mem.length > this._memMax) this._mem = this._mem.slice(-this._memMax)
 
+    let debugRec = null
     if (ctx.mode === 'debug') {
-      const debugRec = {
+      debugRec = {
         ...summary,
         headers: ctx.headers,
         inbound_summary: extra.inbound_summary || summarizeBody(extra.inbound_body),
@@ -562,10 +631,10 @@ export class RequestLogStore {
             : null,
         response: ctx.response ? debugResponse(ctx.response) : null,
       }
-      try {
-        this.repo.insertDebug(summary.request_id || summary.id, summary.ts, debugRec)
-      } catch {}
     }
+    try {
+      this._persistWrite({ summary, debug: debugRec })
+    } catch {}
     return summary
   }
 
@@ -621,7 +690,11 @@ export class RequestLogStore {
   }
 
   totals() {
-    return this.repo.totals()
+    const now = Date.now()
+    if (this._totalsCache && now - this._totalsCache.at < TOTALS_CACHE_MS) return this._totalsCache.value
+    const value = this.repo.totals()
+    this._totalsCache = { at: now, value }
+    return value
   }
 
   hasSuccessfulRequest(opts = {}) {
@@ -629,7 +702,22 @@ export class RequestLogStore {
   }
 
   billingStats(opts = {}) {
-    return this.repo.billingStats(opts)
+    const now = Date.now()
+    const windows = Array.isArray(opts.accountWindows)
+      ? opts.accountWindows.map((item) => [
+          item?.account_id || '',
+          item?.vm_id || '',
+          item?.reset_5h || '',
+          item?.reset_7d || '',
+        ])
+      : null
+    const key = JSON.stringify([windows, opts.now == null ? null : Math.floor(Number(opts.now) / BILLING_CACHE_MS)])
+    const cached = this._billingCache.get(key)
+    if (cached && now - cached.at < BILLING_CACHE_MS) return cached.value
+    const value = this.repo.billingStats(opts)
+    this._billingCache.set(key, { at: now, value })
+    if (this._billingCache.size > 8) this._billingCache.delete(this._billingCache.keys().next().value)
+    return value
   }
 
   ownerBilling(opts = {}) {
@@ -650,7 +738,14 @@ export class RequestLogStore {
 
   /** Windowed SLA / QPS / TTFT snapshot for overview + log analysis. */
   windowStats(opts = {}) {
-    return this.repo.windowStats(opts)
+    const now = Date.now()
+    const key = JSON.stringify([opts.since || null, opts.until || null, opts.owner_user_id || null])
+    const cached = this._windowStatsCache.get(key)
+    if (cached && now - cached.at < WINDOW_STATS_CACHE_MS) return cached.value
+    const value = this.repo.windowStats(opts)
+    this._windowStatsCache.set(key, { at: now, value })
+    if (this._windowStatsCache.size > 16) this._windowStatsCache.delete(this._windowStatsCache.keys().next().value)
+    return value
   }
 
   protocolEntryStats(opts = {}) {
@@ -689,6 +784,7 @@ export class RequestLogStore {
       recent_normal: this._mem.length,
       backend: 'sqlite',
       jsonl_mirror: this.jsonlMirror,
+      write_queue: this._writeQueue?.snapshot() || null,
       total_rows: (() => {
         try {
           return this.repo.count()
@@ -701,11 +797,16 @@ export class RequestLogStore {
 
   /** Retention: delete rows older than retain windows, then enforce max_mb. */
   cleanup() {
+    this.flushPending()
     try {
       this.repo.cleanup({
         retainDays: this.retainDays,
         debugRetainDays: this.debugRetainDays,
-        maxBytes: this.maxMb > 0 ? this.maxMb * 1024 * 1024 : 0,
+        // SUM(LENGTH(record_json)) walks every overflow page. A multi-GB debug
+        // table can block the single Node event loop for seconds even after
+        // logging returns to normal. The table cannot grow outside debug mode,
+        // so enforce the byte cap only while full records are being written.
+        maxBytes: this.mode === 'debug' && this.maxMb > 0 ? this.maxMb * 1024 * 1024 : 0,
       })
     } catch {}
     this._cleanupLegacyFiles(this.retainDays, this.root)

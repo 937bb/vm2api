@@ -26,7 +26,12 @@ import {
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
-import { parseCodexImportPayload, upsertCodexAccount, readCodexAccounts } from '../vm/codex-slot.mjs'
+import {
+  parseCodexImportPayload,
+  upsertCodexAccount,
+  readCodexAccounts,
+  syncCodexAccountScheduling,
+} from '../vm/codex-slot.mjs'
 import { generateAuthUrl, exchangeAuthCode, normalizeOauthFlavor } from '../oauth/oauth-auth-url.mjs'
 import { sessionKeyToOAuth, panelImportErrorPayload } from '../oauth/cookie-auth.mjs'
 import { enrichOauthIdentity } from '../oauth/oauth-identity.mjs'
@@ -231,6 +236,18 @@ import { countTokensViaWorker } from '../transport/go-worker-client.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from '../protocol/claude-code-betas.mjs'
 import { rustKernelHealth, toPublicKernelHealth } from '../transport/rust-kernel-client.mjs'
 import { codexKernelHealth } from '../transport/codex-kernel-client.mjs'
+import {
+  beginOpenAIAccountRetirement,
+  endOpenAIAccountRetirement,
+  openAIRuntimeSignals,
+} from '../pool/openai-account-runtime.mjs'
+import {
+  clearOpenAIAccountRetiring,
+  globalOpenAILeaseEnabled,
+  globalOpenAILeaseRequired,
+  markOpenAIAccountRetiring,
+  openAIGlobalActiveCount,
+} from '../pool/openai-global-lease.mjs'
 import { setManualScheduleWins } from '../pool/schedule-policy.mjs'
 import { normalizeHealthProbeConfig } from './health-probe.mjs'
 import { normalizeUsageProbeConfig } from '../oauth/usage-probe-monitor.mjs'
@@ -408,6 +425,7 @@ async function commitImportedCodexVm({
     stampVmKind(vm)
   })
   if (writtenCodex) Object.assign(existing, writtenCodex)
+  syncCodexAccountScheduling(cfg.paths.project, existing)
   let catalog = null
   try {
     catalog = await syncCodexCatalog({
@@ -508,6 +526,7 @@ export function createPanelHandler(ctx) {
   const officialCcStatsHandler = (...args) => ctx.officialCcStatsHandler(...args)
   const refreshWorkerCredentialForVm = (...args) => ctx.refreshWorkerCredentialForVm(...args)
   const fetchWorkerModels = (...args) => ctx.fetchWorkerModels(...args)
+  const destroyVmSlot = ctx.destroySlot || destroySlot
 
   function restoreSchedulableIfReady(vmId) {
     const vm = getVm(cfg.paths.project, vmId)
@@ -1569,6 +1588,7 @@ export function createPanelHandler(ctx) {
         const bucket = (u.searchParams.get('bucket') || 'day').toLowerCase() === 'hour' ? 'hour' : 'day'
         const since = u.searchParams.get('since') || new Date(Date.now() - 7 * 86400_000).toISOString()
         const until = u.searchParams.get('until') || null
+        const overview = u.searchParams.get('view') === 'overview'
         const tenant = panelIdentity(req).role === 'user'
         const owner_user_id = tenant ? req.panelUserId : u.searchParams.get('user_id') || null
         return json(res, 200, {
@@ -1576,8 +1596,8 @@ export function createPanelHandler(ctx) {
           bucket,
           since,
           until,
-          totals: tenant ? null : requestLog.totals(),
-          buckets: requestLog.aggregate({ since, until, bucket, owner_user_id }),
+          totals: tenant || overview ? null : requestLog.totals(),
+          buckets: overview ? [] : requestLog.aggregate({ since, until, bucket, owner_user_id }),
           window: requestLog.windowStats({ since, until, owner_user_id }),
           muted_error_classes: requestLog.snapshot().muted_error_classes,
           config: tenant ? null : requestLog.snapshot(),
@@ -1774,6 +1794,7 @@ export function createPanelHandler(ctx) {
             poolScheduler: ctx.poolScheduler,
             proxyPool,
             clusterNodes: clusterNodesOf(ctx),
+            includeHeavyStats: url.searchParams.get('view') !== 'overview',
           }),
         )
       }
@@ -2554,6 +2575,22 @@ export function createPanelHandler(ctx) {
             error: { code: 'credential_unavailable', message: '凭证已失效或吊销，请重新导入凭证后再开启调度' },
           })
         }
+        if (body.schedulable && isCodexVm(currentVm)) {
+          try {
+            await clearOpenAIAccountRetiring(id)
+          } catch (error) {
+            if (globalOpenAILeaseRequired()) {
+              return json(res, 503, {
+                ok: false,
+                error: {
+                  code: 'capacity_backend_unavailable',
+                  message: '并发协调 Redis 不可用，拒绝恢复 GPT 调度',
+                },
+              })
+            }
+          }
+          endOpenAIAccountRetirement(id)
+        }
         const reason = body.schedulable ? null : body.reason || 'disabled'
         const summary = setVmSchedulable(cfg.paths.project, id, body.schedulable, reason, {
           preserveStatus: true,
@@ -2624,54 +2661,101 @@ export function createPanelHandler(ctx) {
           return json(res, 400, { ok: false, error: { message: 'invalid vm id' } })
         }
         const vmPath = path.join(cfg.paths.project, 'vms', `${id}.json`)
-        if (!fs.existsSync(vmPath)) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        const active = getActiveVmId(cfg.paths.project)
-        if (active === id && listVms(cfg.paths.project).some((vm) => vm.id !== id)) {
-          return json(res, 409, { ok: false, error: { message: 'cannot delete active VM, switch active first' } })
-        }
-        const vm = getVm(cfg.paths.project, id)
-        if (denyIfUserCannotDeleteVm(req, res, vm, json)) return true
-        try {
-          if (vm) {
-            const gone = await destroySlot(vm)
-            // A node slot that could not be removed keeps running there with the account's credential.
-            if (!gone.ok && slotHost(vm).kind === 'node') {
+        return await withVmLock(vmPath, async () => {
+          if (!fs.existsSync(vmPath)) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          const active = getActiveVmId(cfg.paths.project)
+          if (active === id && listVms(cfg.paths.project).some((vm) => vm.id !== id)) {
+            return json(res, 409, { ok: false, error: { message: 'cannot delete active VM, switch active first' } })
+          }
+          const vm = getVm(cfg.paths.project, id)
+          if (denyIfUserCannotDeleteVm(req, res, vm, json)) return true
+
+          if (isCodexVm(vm)) {
+            beginOpenAIAccountRetirement(id)
+            setVmSchedulable(cfg.paths.project, id, false, 'account_retiring', {
+              preserveStatus: true,
+              source: 'force',
+            })
+            let globalActive = 0
+            try {
+              if (globalOpenAILeaseEnabled()) {
+                const retirement = await markOpenAIAccountRetiring(id)
+                globalActive = Math.max(Number(retirement.active) || 0, await openAIGlobalActiveCount(id))
+              }
+            } catch (error) {
+              if (globalOpenAILeaseRequired()) {
+                return json(res, 503, {
+                  ok: false,
+                  error: {
+                    code: 'capacity_backend_unavailable',
+                    message: '并发协调 Redis 不可用，账号已退出调度但不会删除',
+                  },
+                })
+              }
+            }
+            const localActive = Number(openAIRuntimeSignals(id).inFlight) || 0
+            const inFlight = Math.max(localActive, globalActive)
+            if (inFlight > 0) {
               return json(res, 409, {
                 ok: false,
-                error: { code: gone.code || 'remote_destroy_failed', message: gone.error || 'remote destroy failed' },
+                error: {
+                  code: 'vm_in_flight',
+                  message: '账号仍有活动请求，已退出调度；请求归零后重试删除',
+                  details: { in_flight: inFlight },
+                },
               })
             }
           }
-        } catch {}
-        // detach this VM only — do not unbind other slots sharing the SOCKS5
-        try {
-          proxyPool.unbindVm(id)
-        } catch {}
-        // remove cli-home
-        try {
-          fs.rmSync(path.join(cfg.paths.project, 'vms', id), { recursive: true, force: true })
-        } catch {}
-        fs.unlinkSync(vmPath)
-        invalidateVmSlotReadCache(cfg.paths.project, id)
-        if (active === id) {
-          clearActiveVm(cfg.paths.project)
+
+          if (vm) {
+            let gone
+            try {
+              gone = await destroyVmSlot(vm)
+            } catch (error) {
+              gone = { ok: false, error: String(error?.message || error) }
+            }
+            if (!gone?.ok) {
+              return json(res, 409, {
+                ok: false,
+                error: { code: gone?.code || 'slot_destroy_failed', message: gone?.error || 'slot destroy failed' },
+              })
+            }
+          }
+          // detach this VM only — do not unbind other slots sharing the SOCKS5
           try {
-            clearActiveVmFromDb()
+            proxyPool.unbindVm(id)
           } catch {}
+          // remove cli-home
           try {
-            reloadActiveVm(cfg)
+            fs.rmSync(path.join(cfg.paths.project, 'vms', id), { recursive: true, force: true })
           } catch {}
-        }
-        // drop the DB credential mirror row too
-        try {
-          removeVmFromDb(id)
-        } catch {}
-        // optional chat side files
-        try {
-          const chat = path.join(cfg.paths.project, 'vms', `${id}-chat.json`)
-          if (fs.existsSync(chat)) fs.unlinkSync(chat)
-        } catch {}
-        return json(res, 200, panel.ok({ deleted: id }))
+          fs.unlinkSync(vmPath)
+          invalidateVmSlotReadCache(cfg.paths.project, id)
+          if (active === id) {
+            clearActiveVm(cfg.paths.project)
+            try {
+              clearActiveVmFromDb()
+            } catch {}
+            try {
+              reloadActiveVm(cfg)
+            } catch {}
+          }
+          // drop the DB credential mirror row too
+          try {
+            removeVmFromDb(id)
+          } catch {}
+          // optional chat side files
+          try {
+            const chat = path.join(cfg.paths.project, 'vms', `${id}-chat.json`)
+            if (fs.existsSync(chat)) fs.unlinkSync(chat)
+          } catch {}
+          if (isCodexVm(vm)) {
+            try {
+              await clearOpenAIAccountRetiring(id)
+            } catch {}
+          }
+          return json(res, 200, panel.ok({ deleted: id }))
+        })
       }
       // POST /api/panel/vms/:id/reset — destroy container + home, recreate same slot
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/reset$/.test(p)) {

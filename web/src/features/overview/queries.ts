@@ -13,6 +13,15 @@ export function dashboardQueryOptions(refetchInterval?: number) {
   })
 }
 
+export function overviewDashboardQueryOptions() {
+  return queryOptions({
+    queryKey: ['panel', 'dashboard', 'overview'] as const,
+    queryFn: () => api<Dashboard>('/api/panel/dashboard?view=overview'),
+    staleTime: 5_000,
+    refetchOnWindowFocus: false,
+  })
+}
+
 export function usageQueryOptions(refetchInterval?: number) {
   return queryOptions({
     queryKey: ['panel', 'usage'] as const,

@@ -114,6 +114,112 @@ test('expired sessions purge on resolve/stats', () => {
   assert.equal(r.stats().active_sessions, 0)
 })
 
+test('activeSessionCount uses COUNT without materializing session rows', () => {
+  const r = new StickyRouter({ dataDir: tmpDir(), config: { sticky: { enabled: true, ttl_seconds: 60 } } })
+  r.bind('conv-count-a', { accountId: 'a', vmId: 'v' })
+  r.bind('conv-count-b', { accountId: 'a', vmId: 'v' })
+  r.repo.all = () => {
+    throw new Error('session rows must not be materialized')
+  }
+  assert.equal(r.activeSessionCount(), 2)
+})
+
+test('resolve deletes only the requested expired row and leaves global purge off the hot path', () => {
+  const r = new StickyRouter({ dataDir: tmpDir(), config: { sticky: { enabled: true, ttl_seconds: 60 } } })
+  r.bind('live', { accountId: 'a', vmId: 'v' })
+  r.repo.upsert('expired', {
+    account_id: 'a',
+    vm_id: 'v',
+    bound_at: Date.now() - 2000,
+    expires_at: Date.now() - 1000,
+  })
+  const purgeExpired = r.repo.purgeExpired.bind(r.repo)
+  let globalPurges = 0
+  r.repo.purgeExpired = (now) => {
+    globalPurges += 1
+    return purgeExpired(now)
+  }
+
+  assert.equal(r.resolve('live').vmId, 'v')
+  assert.equal(r.resolve('expired'), null)
+  assert.equal(globalPurges, 0)
+  assert.equal(r.stats().active_sessions, 1)
+  assert.equal(globalPurges, 1)
+})
+
+test('resolve caches positive and negative sticky lookups', () => {
+  const r = new StickyRouter({
+    dataDir: tmpDir(),
+    config: { sticky: { enabled: true, ttl_seconds: 60 } },
+    cache: { positiveTtlMs: 60_000, negativeTtlMs: 60_000 },
+  })
+  r.bind('cached', { accountId: 'a', vmId: 'v' })
+  r.cache.clear()
+  const get = r.repo.get.bind(r.repo)
+  let reads = 0
+  r.repo.get = (key) => {
+    reads += 1
+    return get(key)
+  }
+
+  assert.equal(r.resolve('cached').vmId, 'v')
+  assert.equal(r.resolve('cached').vmId, 'v')
+  assert.equal(r.resolve('missing'), null)
+  assert.equal(r.resolve('missing'), null)
+  assert.equal(reads, 2)
+})
+
+test('sticky writes and removals keep the lookup cache coherent', () => {
+  const r = new StickyRouter({
+    dataDir: tmpDir(),
+    config: { sticky: { enabled: true, ttl_seconds: 60 } },
+    cache: { positiveTtlMs: 60_000, negativeTtlMs: 60_000 },
+  })
+  assert.equal(r.resolve('coherent'), null)
+  r.bind('coherent', { accountId: 'a', vmId: 'v1' })
+  assert.equal(r.resolve('coherent').vmId, 'v1')
+  r.rebindFamily('coherent', { accountId: 'b', vmId: 'v2' })
+  assert.equal(r.resolve('coherent').vmId, 'v2')
+  r.unbind('coherent')
+  assert.equal(r.resolve('coherent'), null)
+})
+
+test('expired cache entries are removed without returning stale bindings', () => {
+  const r = new StickyRouter({
+    dataDir: tmpDir(),
+    config: { sticky: { enabled: true, ttl_seconds: -1 } },
+    cache: { positiveTtlMs: 60_000 },
+  })
+  r.bind('expired-cache', { accountId: 'a', vmId: 'v' })
+  assert.equal(r.resolve('expired-cache'), null)
+  assert.equal(r.cache.has('expired-cache'), false)
+  assert.equal(r.repo.get('expired-cache'), null)
+})
+
+test('sticky lookup cache is bounded and reload invalidates it', () => {
+  const r = new StickyRouter({
+    dataDir: tmpDir(),
+    config: { sticky: { enabled: true, ttl_seconds: 60 } },
+    cache: { maxEntries: 2, positiveTtlMs: 60_000, negativeTtlMs: 60_000 },
+  })
+  r.resolve('missing-a')
+  r.resolve('missing-b')
+  r.resolve('missing-c')
+  assert.equal(r.cache.size, 2)
+  assert.equal(r.cache.has('missing-a'), false)
+  r.reload()
+  assert.equal(r.cache.size, 0)
+})
+
+test('unbindByAccount invalidates matching cached bindings only', () => {
+  const r = new StickyRouter({ dataDir: tmpDir(), config: { sticky: { enabled: true, ttl_seconds: 60 } } })
+  r.bind('remove-me', { accountId: 'a', vmId: 'v1' })
+  r.bind('keep-me', { accountId: 'b', vmId: 'v2' })
+  assert.equal(r.unbindByAccount({ accountId: 'a' }), 1)
+  assert.equal(r.resolve('remove-me'), null)
+  assert.equal(r.resolve('keep-me').vmId, 'v2')
+})
+
 test('disabled sticky returns null and binds nothing', () => {
   const r = new StickyRouter({ dataDir: tmpDir(), config: { sticky: { enabled: false } } })
   r.bind('conv-3', { accountId: 'a', vmId: 'v' })
@@ -564,6 +670,17 @@ test('canonical identity keys are not scoped to API keys', () => {
   assert.notEqual(r.canonicalDeviceKey('device-1'), r.canonicalDeviceKey('device-2'))
   assert.equal(r.canonicalSessionKey(''), null)
   assert.equal(r.canonicalDeviceKey(''), null)
+})
+
+test('response affinity keys are isolated by API key and platform', () => {
+  const r = new StickyRouter({ dataDir: tmpDir(), config: { sticky: { enabled: true } } })
+  const reqA = { apiKeyRecord: { id: 'key-a' } }
+  const reqB = { apiKeyRecord: { id: 'key-b' } }
+
+  assert.equal(r.responseKey(reqA, 'resp_1'), 'p:openai:kkey-a:resp:resp_1')
+  assert.equal(r.responseKey(reqB, 'resp_1'), 'p:openai:kkey-b:resp:resp_1')
+  assert.equal(r.responseKey(reqA, 'resp_1', 'anthropic'), 'p:anthropic:kkey-a:resp:resp_1')
+  assert.equal(r.responseKey(reqA, ''), null)
 })
 
 test('canonical identity keys ignore account_uuid changes', () => {

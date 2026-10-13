@@ -348,6 +348,24 @@ test('oauth usage uses Extra and does not hop', async () => {
   assert.equal(cap.calls[0].body.vm_id, undefined)
 })
 
+test('GPT-only usage probe is unsupported instead of a gateway 503', async () => {
+  const cap = jsonCapture()
+  await handleUserUsage(
+    {},
+    {},
+    {
+      json: cap.json,
+      requireAuth: () => true,
+      stickyRouter: { extractPoolKey: () => null },
+      getPoolScheduler: () => ({
+        peekAccount: async () => ({ ok: false, code: 'no_eligible_accounts' }),
+      }),
+    },
+  )
+  assert.equal(cap.calls[0].status, 400)
+  assert.equal(cap.calls[0].body.error.code, 'usage_unsupported')
+})
+
 test('empty Extra hops cached official usage once', async () => {
   let probes = 0
   const store = { unified: {} }

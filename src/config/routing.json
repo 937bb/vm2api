@@ -58,7 +58,7 @@
     }
   },
   "logging": {
-    "mode": "debug",
+    "mode": "normal",
     "retain_days": 7,
     "debug_retain_days": 3,
     "max_mb": 2048
@@ -113,7 +113,7 @@
     "quota": {
       "limit_5h": 1,
       "limit_7d": 1,
-      "max_concurrency": 2,
+      "max_concurrency": 40,
       "max_rpm": 0,
       "max_sessions": 0
     }

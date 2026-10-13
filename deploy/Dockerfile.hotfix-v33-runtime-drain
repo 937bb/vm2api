@@ -1,0 +1,51 @@
+FROM node:22-bookworm-slim AS web-v33
+RUN npm install -g pnpm@10
+WORKDIR /src/web
+COPY web/package.json web/pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY web/ ./
+RUN pnpm build
+
+FROM vm2api-local:v1.3.153-hotfix-v32-db-write-buffer
+LABEL org.opencontainers.image.version="1.3.153-hotfix-v33-runtime-drain"
+
+COPY src/lib/admin/api-keys.mjs /opt/vm2api/src/lib/admin/api-keys.mjs
+COPY src/lib/admin/backup-service.mjs /opt/vm2api/src/lib/admin/backup-service.mjs
+COPY src/lib/admin/panel-api.mjs /opt/vm2api/src/lib/admin/panel-api.mjs
+COPY src/lib/admin/panel-live-credentials.mjs /opt/vm2api/src/lib/admin/panel-live-credentials.mjs
+COPY src/lib/admin/panel-routes.mjs /opt/vm2api/src/lib/admin/panel-routes.mjs
+COPY src/lib/admin/pricing.mjs /opt/vm2api/src/lib/admin/pricing.mjs
+COPY src/lib/admin/request-log.mjs /opt/vm2api/src/lib/admin/request-log.mjs
+COPY src/lib/admin/routing-runtime.mjs /opt/vm2api/src/lib/admin/routing-runtime.mjs
+COPY src/lib/db/buffered-write-queue.mjs /opt/vm2api/src/lib/db/buffered-write-queue.mjs
+COPY src/lib/db/database.mjs /opt/vm2api/src/lib/db/database.mjs
+COPY src/lib/db/repos/api-keys-repo.mjs /opt/vm2api/src/lib/db/repos/api-keys-repo.mjs
+COPY src/lib/db/repos/request-attempts-repo.mjs /opt/vm2api/src/lib/db/repos/request-attempts-repo.mjs
+COPY src/lib/db/repos/usage-logs-repo.mjs /opt/vm2api/src/lib/db/repos/usage-logs-repo.mjs
+COPY src/lib/http/client-error.mjs /opt/vm2api/src/lib/http/client-error.mjs
+COPY src/lib/http/gateway-runtime.mjs /opt/vm2api/src/lib/http/gateway-runtime.mjs
+COPY src/lib/pool/api-protocol.mjs /opt/vm2api/src/lib/pool/api-protocol.mjs
+COPY src/lib/pool/codex-slot-pool.mjs /opt/vm2api/src/lib/pool/codex-slot-pool.mjs
+COPY src/lib/pool/openai-account-runtime.mjs /opt/vm2api/src/lib/pool/openai-account-runtime.mjs
+COPY src/lib/pool/openai-quota-policy.mjs /opt/vm2api/src/lib/pool/openai-quota-policy.mjs
+COPY src/lib/pool/sticky-router.mjs /opt/vm2api/src/lib/pool/sticky-router.mjs
+COPY src/lib/protocol/codex-convert.mjs /opt/vm2api/src/lib/protocol/codex-convert.mjs
+COPY src/lib/protocol/codex-usage.mjs /opt/vm2api/src/lib/protocol/codex-usage.mjs
+COPY src/lib/protocol/handle-codex.mjs /opt/vm2api/src/lib/protocol/handle-codex.mjs
+COPY src/lib/protocol/handle-protocol.mjs /opt/vm2api/src/lib/protocol/handle-protocol.mjs
+COPY src/lib/protocol/stream-backpressure.mjs /opt/vm2api/src/lib/protocol/stream-backpressure.mjs
+COPY src/lib/protocol/stream-keepalive.mjs /opt/vm2api/src/lib/protocol/stream-keepalive.mjs
+COPY src/lib/protocol/user-count-tokens.mjs /opt/vm2api/src/lib/protocol/user-count-tokens.mjs
+COPY src/lib/transport/codex-kernel-client.mjs /opt/vm2api/src/lib/transport/codex-kernel-client.mjs
+COPY src/lib/transport/codex-kernel-supervisor.mjs /opt/vm2api/src/lib/transport/codex-kernel-supervisor.mjs
+COPY src/lib/transport/go-worker-client.mjs /opt/vm2api/src/lib/transport/go-worker-client.mjs
+COPY src/lib/vm/codex-slot.mjs /opt/vm2api/src/lib/vm/codex-slot.mjs
+COPY src/lib/vm/proxy-policy.mjs /opt/vm2api/src/lib/vm/proxy-policy.mjs
+COPY src/lib/vm/proxy-pool.mjs /opt/vm2api/src/lib/vm/proxy-pool.mjs
+COPY src/lib/vm/slot-runtime.mjs /opt/vm2api/src/lib/vm/slot-runtime.mjs
+COPY src/lib/vm/vm-registry.mjs /opt/vm2api/src/lib/vm/vm-registry.mjs
+COPY src/server.mjs /opt/vm2api/src/server.mjs
+COPY --from=web-v33 /src/web/dist /opt/vm2api/web/dist
+
+RUN printf '%s\n' '1.3.153-hotfix-v33-runtime-drain' > /opt/vm2api/VERSION
+ENV VM2API_BUILD=1.3.153-hotfix-v33-runtime-drain

@@ -40,6 +40,7 @@ import { runVmTestChat } from './lib/admin/vm-test-chat.mjs'
 import { StickyRouter } from './lib/pool/sticky-router.mjs'
 import { setManualScheduleWins } from './lib/pool/schedule-policy.mjs'
 import { AccountQuota } from './lib/pool/account-quota.mjs'
+import { closeOpenAIGlobalLeaseClient } from './lib/pool/openai-global-lease.mjs'
 import { normalizeTiers } from './lib/pool/quota-tiers.mjs'
 import { ApiKeyStore } from './lib/admin/api-keys.mjs'
 import { keyScopeFromRequest } from './lib/admin/key-scope.mjs'
@@ -63,6 +64,7 @@ import {
   isCodexVm,
   syncCodexQuotaSchedule,
 } from './lib/vm/vm-registry.mjs'
+import { syncCodexAccountScheduling } from './lib/vm/codex-slot.mjs'
 import { makeError, ErrorType, ErrorCode } from './lib/core/errors.mjs'
 import * as panel from './lib/admin/panel-api.mjs'
 import { ProxyPool } from './lib/vm/proxy-pool.mjs'
@@ -90,6 +92,8 @@ import { normalizeCredentialMode } from './lib/oauth/credential-mode.mjs'
 import { ensureWorkerCredential } from './lib/transport/go-worker-client.mjs'
 import { stopAllRustKernels } from './lib/transport/rust-kernel-supervisor.mjs'
 import { createRespond, parseRequestUrl } from './lib/http/respond.mjs'
+import { handleHttpClientError } from './lib/http/client-error.mjs'
+import { createGatewayRuntime, isInferenceRequest } from './lib/http/gateway-runtime.mjs'
 import { isConsoleEntry, tryServeWebDist } from './lib/http/web-dist.mjs'
 import { createRoutingRuntime } from './lib/admin/routing-runtime.mjs'
 import { createImportCommit } from './lib/oauth/import-commit.mjs'
@@ -124,6 +128,15 @@ const LIMITATIONS = {
 }
 
 const cfg = loadConfig()
+const gatewayRuntime = createGatewayRuntime()
+const buildVersion = (() => {
+  if (String(process.env.VM2API_BUILD || '').trim()) return String(process.env.VM2API_BUILD).trim()
+  try {
+    return fs.readFileSync(path.join(cfg.paths.project, 'VERSION'), 'utf8').trim() || 'unknown'
+  } catch {
+    return 'unknown'
+  }
+})()
 if (!getPanelAdmin().password) {
   throw new Error('VM2API_ADMIN_PASSWORD must be set; insecure default panel credentials are disabled')
 }
@@ -269,6 +282,15 @@ const {
 
 routingConfig = loadRoutingConfig()
 migrateLegacyOpenAIPolicies(routingConfig)
+let codexSchedulingUpdated = 0
+for (const listed of listVms(cfg.paths.project)) {
+  const vm = getVm(cfg.paths.project, listed.id) || listed
+  if (!isCodexVm(vm)) continue
+  if (syncCodexAccountScheduling(cfg.paths.project, vm).updated) codexSchedulingUpdated += 1
+}
+if (codexSchedulingUpdated) {
+  console.log(`[codex] synchronized kernel scheduling for ${codexSchedulingUpdated} slot(s)`)
+}
 setManualScheduleWins(routingConfig.pool?.manual_schedule_wins)
 if (routingConfig.official_cc) {
   routingConfig.official_cc = normalizeOfficialCcConfig(routingConfig.official_cc)
@@ -313,6 +335,7 @@ attachPanelAuth({
 requestLog = new RequestLogStore({
   dataDir: cfg.paths.data,
   mode: process.env.KIN_REQUEST_LOG_MODE || routingConfig?.logging?.mode || 'normal',
+  bufferedWrites: process.env.KIN_DB_WRITE_BUFFER !== '0',
 })
 if (routingConfig?.logging) {
   requestLog.setConfig({
@@ -509,6 +532,10 @@ const backupService = new BackupService({
   dataDir,
   projectRoot: cfg.paths.project,
   configDir: path.dirname(routingConfigPath),
+})
+backupService.onBeforeRestore(() => {
+  requestLog.flushPending()
+  attemptsRepo?.flushPending?.()
 })
 backupService.onRestored((db) => {
   // A restore swaps the DatabaseSync instance and routing files. Rebuild every
@@ -808,6 +835,10 @@ const { handleProtocol, handleSearch } = createHandleProtocol({
   get poolScheduler() {
     return poolScheduler
   },
+  getAttemptsRepo: () => attemptsRepo,
+  get attemptsRepo() {
+    return attemptsRepo
+  },
   get groupsRepo() {
     return groupsRepo
   },
@@ -912,6 +943,7 @@ const handlePanel = createPanelHandler({
 })
 
 const server = http.createServer(async (req, res) => {
+  const requestScope = gatewayRuntime.beginRequest()
   try {
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
@@ -928,6 +960,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 400, { error: { message: 'Invalid URL', type: 'invalid_request' } })
     }
     const p = url.pathname
+    if (isInferenceRequest(req.method, p)) requestScope.markInference()
 
     if (isTelemetryPath(p)) {
       return json(res, 200, telemetryInterceptResponse(p))
@@ -972,6 +1005,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, {
         status: 'ok',
         service: 'vm2api',
+        version: buildVersion,
         base_url: cfg.base_url,
         rewrite: cfg.rewrite.enabled ? 'on' : 'off',
         intercept_rules: cfg.intercept.rules.length,
@@ -980,6 +1014,7 @@ const server = http.createServer(async (req, res) => {
         capabilities: GATEWAY_CAPABILITIES,
         limitations: LIMITATIONS,
         stats,
+        runtime: gatewayRuntime.snapshot(),
         health_probe: healthMonitor?.getSnapshot?.() || null,
         api_kernel: {
           ...apiKernelSnapshot(cfg),
@@ -1070,6 +1105,8 @@ const server = http.createServer(async (req, res) => {
         res.end()
       } catch {}
     }
+  } finally {
+    requestScope.release()
   }
 })
 
@@ -1078,26 +1115,7 @@ server.on('upgrade', (req, socket, head) => {
   if (!slotShell.handleUpgrade(req, socket, head)) socket.destroy()
 })
 
-server.on('clientError', (err, socket) => {
-  try {
-    console.error(
-      JSON.stringify({
-        event: 'http_client_error',
-        code: err?.code || null,
-        message: String(err?.message || err).slice(0, 200),
-      }),
-    )
-  } catch {}
-  if (!socket || !socket.writable) {
-    try {
-      socket?.destroy()
-    } catch {}
-    return
-  }
-  socket.end(
-    'HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{"error":{"type":"invalid_request_error","message":"malformed request"}}\n',
-  )
-})
+server.on('clientError', handleHttpClientError)
 
 const pub = {
   base_url: cfg.base_url,
@@ -1124,11 +1142,13 @@ fs.writeFileSync(path.join(cfg.paths.root, 'config', 'gateway-v2.public.json'), 
 process.on('uncaughtException', (e) => console.error('[uncaught]', e))
 process.on('unhandledRejection', (e) => console.error('[unhandled]', e))
 
-// Graceful shutdown: stop schedulers/watchers, close the DB (WAL checkpoint).
+// Graceful shutdown: stop accepting work, drain active HTTP streams, then stop
+// child kernels and close the DB. Docker must allow at least this grace period.
 let _shuttingDown = false
 function shutdown(signal) {
   if (_shuttingDown) return
   _shuttingDown = true
+  gatewayRuntime.startDraining()
   console.log(`[shutdown] ${signal} — closing`)
   try {
     backupService.stopScheduler()
@@ -1158,24 +1178,57 @@ function shutdown(signal) {
   try {
     stopVmWatch()
   } catch {}
-  try {
-    stopAllRustKernels()
-  } catch {}
-  try {
-    clusterManager.stop()
-  } catch {}
-  try {
-    server.close(() => {})
-  } catch {}
-  try {
-    closeDatabase()
-  } catch {}
-  process.exit(0)
+  let finalized = false
+  const finalize = (reason) => {
+    if (finalized) return
+    finalized = true
+    console.log(`[shutdown] ${signal} — ${reason}`)
+    try {
+      stopAllRustKernels()
+    } catch {}
+    try {
+      clusterManager.stop()
+    } catch {}
+    try {
+      requestLog.stop()
+    } catch {}
+    try {
+      attemptsRepo?.stop?.()
+    } catch {}
+    try {
+      closeOpenAIGlobalLeaseClient()
+    } catch {}
+    try {
+      closeDatabase()
+    } catch {}
+    gatewayRuntime.stop()
+    process.exit(0)
+  }
+  const graceMs = Math.min(300_000, Math.max(1000, Number(process.env.KIN_SHUTDOWN_GRACE_MS) || 120_000))
+  const timer = setTimeout(() => finalize('drain timeout'), graceMs)
+  timer.unref?.()
+  let closeReason = 'drained'
+  const serverClosed = new Promise((resolve) => {
+    try {
+      server.close(resolve)
+      server.closeIdleConnections?.()
+    } catch {
+      closeReason = 'close failed'
+      resolve()
+    }
+  })
+  Promise.all([serverClosed, gatewayRuntime.whenIdle()])
+    .then(() => {
+      clearTimeout(timer)
+      finalize(closeReason)
+    })
+    .catch(() => finalize('drain failed'))
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'))
 process.on('SIGINT', () => shutdown('SIGINT'))
 
-server.listen(cfg.port, cfg.host, () => {
+const listenBacklog = Math.trunc(Math.min(65_535, Math.max(511, Number(process.env.KIN_LISTEN_BACKLOG) || 4096)))
+server.listen({ port: cfg.port, host: cfg.host, backlog: listenBacklog }, () => {
   try {
     healthMonitor?.start?.({ immediate: true })
   } catch (e) {
@@ -1225,6 +1278,7 @@ server.listen(cfg.port, cfg.host, () => {
     JSON.stringify({
       event: 'vm2api-started',
       port: boundPort,
+      listen_backlog: listenBacklog,
       base_url: cfg.base_url,
       active_vm: getActiveVmId(cfg.paths.project),
       features: pub.features,

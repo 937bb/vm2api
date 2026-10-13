@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { createDatabase } from '../../src/lib/db/database.mjs'
 import { AccountRuntimeRepo } from '../../src/lib/db/repos/account-runtime-repo.mjs'
-import { RequestAttemptsRepo } from '../../src/lib/db/repos/request-attempts-repo.mjs'
+import { compactAttemptUsage, RequestAttemptsRepo } from '../../src/lib/db/repos/request-attempts-repo.mjs'
 
 test('account runtime state persists account and model cooldowns', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-runtime-repo-'))
@@ -146,7 +146,7 @@ test('request attempt ledger records final state and commit boundary', () => {
   const db = createDatabase({ dataDir: dir })
   try {
     const repo = new RequestAttemptsRepo(db)
-    repo.begin({
+    const started = repo.begin({
       requestId: 'req-1',
       attemptNo: 1,
       vmId: 'vm-01',
@@ -155,6 +155,7 @@ test('request attempt ledger records final state and commit boundary', () => {
       selectionReason: 'balanced',
       waitMs: 4,
     })
+    assert.equal(started.terminal_state, 'started')
     repo.complete('req-1', 1, {
       upstreamStatus: 429,
       errorScope: 'account',
@@ -171,7 +172,7 @@ test('request attempt ledger records final state and commit boundary', () => {
       model: 'claude-test',
       selectionReason: 'failover',
     })
-    repo.complete('req-1', 2, {
+    const completed = repo.complete('req-1', 2, {
       upstreamStatus: 200,
       downstreamCommitted: true,
       terminalState: 'verified',
@@ -179,6 +180,7 @@ test('request attempt ledger records final state and commit boundary', () => {
       ttftMs: 20,
       latencyMs: 40,
     })
+    assert.equal(completed.terminal_state, 'verified')
     const attempts = repo.list('req-1')
     assert.equal(attempts.length, 2)
     assert.equal(attempts[0].action, 'continue-and-cooldown')
@@ -189,4 +191,62 @@ test('request attempt ledger records final state and commit boundary', () => {
     db.close()
     fs.rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test('buffered request attempts preserve begin/complete ordering', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-attempt-buffered-'))
+  const db = createDatabase({ dataDir: dir })
+  try {
+    const repo = new RequestAttemptsRepo(db, {
+      bufferedWrites: true,
+      writeBatchSize: 64,
+      writeFlushIntervalMs: 60_000,
+    })
+    const started = repo.begin({
+      requestId: 'req-buffered',
+      attemptNo: 1,
+      vmId: 'vm-01',
+      accountId: 'account-1',
+      model: 'gpt-5.4',
+      selectionReason: 'sticky',
+    })
+    assert.equal(started.terminal_state, 'started')
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM request_attempts').get().n, 0)
+    repo.complete('req-buffered', 1, {
+      upstreamStatus: 200,
+      downstreamCommitted: true,
+      terminalState: 'verified',
+      usage: { input_tokens: 11, output_tokens: 3 },
+    })
+    const attempts = repo.list('req-buffered')
+    assert.equal(attempts.length, 1)
+    assert.equal(attempts[0].terminal_state, 'verified')
+    assert.equal(attempts[0].downstream_committed, true)
+    assert.deepEqual(attempts[0].usage, { input_tokens: 11, output_tokens: 3 })
+    assert.equal(repo.writeQueueStats().pending, 0)
+    repo.stop()
+  } finally {
+    db.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('request attempt usage drops large Codex attribution trees', () => {
+  const usage = {
+    input_tokens: 607_091,
+    output_tokens: 903,
+    total_tokens: 607_994,
+    input_tokens_details: { cached_tokens: 601_984, cache_write_tokens: 0, ignored: 'x' },
+    output_tokens_details: { reasoning_tokens: 516 },
+    attribution: { items: Array.from({ length: 10_000 }, (_, i) => ({ id: i, text: 'large' })) },
+  }
+  const compact = compactAttemptUsage(usage)
+  assert.deepEqual(compact, {
+    input_tokens: 607_091,
+    output_tokens: 903,
+    total_tokens: 607_994,
+    input_tokens_details: { cached_tokens: 601_984, cache_write_tokens: 0 },
+    output_tokens_details: { reasoning_tokens: 516 },
+  })
+  assert.ok(JSON.stringify(compact).length < 256)
 })

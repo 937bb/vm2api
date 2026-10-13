@@ -42,13 +42,14 @@ export function requestLogQueryOptions(id: string, enabled = true) {
 export function logStatsQueryOptions(
   since: string,
   refetchInterval?: number,
-  bucket: 'hour' | 'day' = 'hour'
+  bucket: 'hour' | 'day' = 'hour',
+  overview = false
 ) {
   return queryOptions({
-    queryKey: ['panel', 'request-logs-stats', bucket, since] as const,
+    queryKey: ['panel', 'request-logs-stats', bucket, since, overview] as const,
     queryFn: () =>
       api<RequestLogStats>(
-        `/api/panel/request-logs/stats?bucket=${bucket}&since=${encodeURIComponent(since)}`
+        `/api/panel/request-logs/stats?bucket=${bucket}&since=${encodeURIComponent(since)}${overview ? '&view=overview' : ''}`
       ),
     ...(refetchInterval
       ? { refetchInterval, refetchOnWindowFocus: false }

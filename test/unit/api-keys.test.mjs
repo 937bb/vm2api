@@ -179,6 +179,48 @@ test('recordUsage accumulates cache token columns', () => {
   assert.equal(saved.cache_creation_tokens, 7)
 })
 
+test('recordUsage atomically marks USD quota exhausted at the exact boundary', () => {
+  const store = tmpStore()
+  const rec = store.create({ name: 'usd-quota', quota: 5 })
+
+  const below = store.recordUsage(rec.id, { cost: 4 })
+  assert.equal(below.quota_used, 4)
+  assert.equal(below.status, 'active')
+
+  const exhausted = store.recordUsage(rec.id, { cost: 1 })
+  assert.equal(exhausted.quota_used, 5)
+  assert.equal(exhausted.status, 'quota_exhausted')
+  assert.equal(store.canAccept(exhausted).code, 'api_key_quota_exhausted')
+})
+
+test('recordUsage resets expired spend windows inside the atomic update', () => {
+  const store = tmpStore()
+  const rec = store.create({
+    name: 'spend-windows',
+    rate_limit_5h: 100,
+    rate_limit_1d: 100,
+    rate_limit_7d: 100,
+  })
+  store.recordUsage(rec.id, { cost: 9 })
+  const expired = new Date(Date.now() - 8 * 24 * 3600_000).toISOString()
+  store.db
+    .prepare(`
+      UPDATE api_keys
+      SET usage_5h = 90, usage_1d = 91, usage_7d = 92,
+          window_5h_start = ?, window_1d_start = ?, window_7d_start = ?
+      WHERE id = ?
+    `)
+    .run(expired, expired, expired, rec.id)
+
+  const reset = store.recordUsage(rec.id, { cost: 3 })
+  assert.equal(reset.usage_5h, 3)
+  assert.equal(reset.usage_1d, 3)
+  assert.equal(reset.usage_7d, 3)
+  assert.ok(Date.parse(reset.window_5h_start) > Date.parse(expired))
+  assert.ok(Date.parse(reset.window_1d_start) > Date.parse(expired))
+  assert.ok(Date.parse(reset.window_7d_start) > Date.parse(expired))
+})
+
 test('custom key rejected when duplicate', () => {
   const store = tmpStore()
   store.create({ name: 'a', key: 'sk-kin-customkey0001' })

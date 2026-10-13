@@ -9,6 +9,9 @@
  *
  * Env:
  *   KIN_DB_PATH — override db file path (default <dataDir>/kin.db)
+ *   KIN_SQLITE_CACHE_KIB — page cache budget in KiB (default 65536)
+ *   KIN_SQLITE_MMAP_BYTES — read-only mmap window (default 268435456)
+ *   KIN_SQLITE_TEMP_STORE — DEFAULT, FILE or MEMORY (default MEMORY)
  */
 
 import fs from 'node:fs'
@@ -19,6 +22,20 @@ import { DatabaseSync } from 'node:sqlite'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const MIGRATIONS_DIR = path.join(__dirname, 'migrations')
+
+function integerEnv(name, fallback, min, max) {
+  const raw = process.env[name]
+  const parsed = raw == null || String(raw).trim() === '' ? Number.NaN : Number(raw)
+  const value = Number.isFinite(parsed) ? Math.trunc(parsed) : fallback
+  return Math.max(min, Math.min(max, value))
+}
+
+function sqliteTempStore() {
+  const value = String(process.env.KIN_SQLITE_TEMP_STORE || 'MEMORY')
+    .trim()
+    .toUpperCase()
+  return value === 'DEFAULT' || value === 'FILE' || value === 'MEMORY' ? value : 'MEMORY'
+}
 
 function sha256Hex(s) {
   return crypto.createHash('sha256').update(s).digest('hex')
@@ -127,6 +144,11 @@ export function createDatabase({ dataDir, dbPath, migrationsDir } = {}) {
   db.exec('PRAGMA synchronous = NORMAL')
   db.exec('PRAGMA busy_timeout = 5000')
   db.exec('PRAGMA foreign_keys = ON')
+  const cacheKiB = integerEnv('KIN_SQLITE_CACHE_KIB', 65_536, 1_024, 1_048_576)
+  const mmapBytes = integerEnv('KIN_SQLITE_MMAP_BYTES', 268_435_456, 0, 2_147_418_112)
+  db.exec(`PRAGMA cache_size = -${cacheKiB}`)
+  db.exec(`PRAGMA mmap_size = ${mmapBytes}`)
+  db.exec(`PRAGMA temp_store = ${sqliteTempStore()}`)
   applyMigrations(db, { migrationsDir })
   return db
 }

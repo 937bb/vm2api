@@ -129,3 +129,13 @@ test('live collect reads slot credentials.json when vm.json TTL is stale', async
   assert.ok(Number(mirrored.claude.expires_at) > Date.now() / 1000 - 10)
   assert.ok(!JSON.stringify(mirrored).includes('test-access'))
 })
+
+test('concurrent cached collects share one in-flight credential map', async () => {
+  invalidateLiveCredentialCache()
+  const project = tmpDir()
+  const calls = Array.from({ length: 40 }, () =>
+    collectLivePanelCredentials(project, [{ id: 'missing-runtime' }], { cacheMs: 3000 }),
+  )
+  const maps = await Promise.all(calls)
+  assert.ok(maps.every((map) => map === maps[0]))
+})

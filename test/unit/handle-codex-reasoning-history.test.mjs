@@ -294,6 +294,7 @@ test('runCodexKernelHop does not stack reasoning fallback after emit, transport 
       return serverError(500)
     },
     args: qualifyingArgs(),
+    retryTransport: true,
   })
   assert.equal(n, 2)
   assert.equal(transportThenError.transport_retried, true)

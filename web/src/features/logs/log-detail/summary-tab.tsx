@@ -271,7 +271,8 @@ export function SummaryTab({
                 </div>
               </TooltipTrigger>
               <TooltipContent>
-                缓存读取 / 输入侧总量（输入 + 缓存读 + 缓存写）
+                OpenAI/Codex 按缓存读取 / 输入；Anthropic 按缓存读取 / （输入 +
+                缓存读 + 缓存写）
               </TooltipContent>
             </Tooltip>
             <div className='rounded-lg border bg-card p-3'>

@@ -1,0 +1,3 @@
+FROM vm2api-local:v1.3.153-hotfix-v26-panel-load
+
+COPY src/lib/pool/sticky-router.mjs /opt/vm2api/src/lib/pool/sticky-router.mjs

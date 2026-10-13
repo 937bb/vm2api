@@ -28,10 +28,13 @@ import {
   isCompleteAssistantMessage,
   isWrapConnectionError,
 } from '../core/errors.mjs'
+import { isContentPolicyErrorCode } from '../core/refusal-guard.mjs'
 import { extraHeadersFromLimitError, isPlanLimitMessage } from '../pool/quota-window.mjs'
 
 const MAX_BODY = 64 * 1024 * 1024
 const credentialRefreshTail = new Map()
+const internalTokenCache = new Map()
+const INTERNAL_TOKEN_CACHE_MS = 1000
 
 function withCredentialRefreshLock(key, fn) {
   const prev = credentialRefreshTail.get(key) || Promise.resolve()
@@ -66,9 +69,15 @@ export function workerPaths(exec = {}) {
 function readInternalToken(exec) {
   const { tokenPath } = workerPaths(exec)
   if (!tokenPath) return ''
+  const now = Date.now()
+  const cached = internalTokenCache.get(tokenPath)
+  if (cached && now - cached.at < INTERNAL_TOKEN_CACHE_MS) return cached.value
   try {
-    return fs.readFileSync(tokenPath, 'utf8').trim()
+    const value = fs.readFileSync(tokenPath, 'utf8').trim()
+    internalTokenCache.set(tokenPath, { at: now, value })
+    return value
   } catch {
+    internalTokenCache.delete(tokenPath)
     return ''
   }
 }
@@ -137,20 +146,22 @@ function workerRequest(
  * the CLI still owned the job. Best effort: the kernel also sees the drop,
  * and an old worker without the route just answers 404.
  */
+function requestKernelCancel(exec, requestId) {
+  workerRequest(exec, {
+    method: 'POST',
+    requestPath: '/internal/v1/cancel',
+    body: { request_id: requestId },
+    timeoutMs: 3000,
+  })
+    .then((res) => res.resume())
+    .catch((error) => {
+      console.warn(`[kernel-cancel] ${exec?.vmId || 'slot'} ${requestId}: ${error?.code || error?.message || error}`)
+    })
+}
+
 function cancelOnAbort(exec, signal, requestId) {
   if (!signal || signal.aborted) return () => {}
-  const onAbort = () => {
-    workerRequest(exec, {
-      method: 'POST',
-      requestPath: '/internal/v1/cancel',
-      body: { request_id: requestId },
-      timeoutMs: 3000,
-    })
-      .then((res) => res.resume())
-      .catch((error) => {
-        console.warn(`[kernel-cancel] ${exec?.vmId || 'slot'} ${requestId}: ${error?.code || error?.message || error}`)
-      })
-  }
+  const onAbort = () => requestKernelCancel(exec, requestId)
   signal.addEventListener('abort', onAbort, { once: true })
   return () => signal.removeEventListener('abort', onAbort)
 }
@@ -239,6 +250,38 @@ function mergeUsage(current, next) {
   return out
 }
 
+function responsesEventType(raw) {
+  const text = String(raw || '').trim()
+  if (!text.startsWith('{') || !text.endsWith('}')) return ''
+  const match = text.match(/^\s*\{\s*"type"\s*:\s*"([^"\\]+)"/) || text.match(/"type"\s*:\s*"([^"\\]+)"/)
+  return match?.[1] || ''
+}
+
+function responsesEventNeedsFullParse(type, raw) {
+  if (!type) return true
+  if (raw.includes('"usage"') || raw.includes('"service_tier"')) return true
+  return (
+    type === 'error' ||
+    type === 'response.created' ||
+    type === 'response.failed' ||
+    type === 'response.incomplete' ||
+    type === 'response.completed' ||
+    type === 'response.done' ||
+    type === 'response_headers' ||
+    type === 'response.output_item.added' ||
+    type === 'response.output_item.done' ||
+    type === 'response.content_part.added' ||
+    type === 'response.content_part.done'
+  )
+}
+
+function parseWorkerSseEvent(raw, mode) {
+  if (mode !== 'responses-passthrough') return JSON.parse(raw)
+  const type = responsesEventType(raw)
+  if (responsesEventNeedsFullParse(type, raw)) return JSON.parse(raw)
+  return type.endsWith('.delta') ? { type, delta: '1' } : { type }
+}
+
 /** First user-visible assistant output — never transport/terminal metadata alone. */
 export function isDownstreamCommitEvent(event) {
   if (!event || typeof event !== 'object') return false
@@ -312,6 +355,19 @@ function isFirstTokenEvent(event) {
   return false
 }
 
+/**
+ * The upstream entered a real response lifecycle. This switches the worker
+ * watchdog from the first-event deadline to the stream-idle deadline, but it
+ * does not mean downstream HTTP 200 is safe to commit: Responses can still
+ * send a structured error immediately after response.created/in_progress.
+ */
+export function isUpstreamAcceptedEvent(event) {
+  if (!event || typeof event !== 'object') return false
+  const type = String(event.type || '')
+  if (type === 'error' || type === 'response_headers') return false
+  return type === 'response.created' || type === 'response.in_progress' || isDownstreamCommitEvent(event)
+}
+
 /** Anthropic SSE: message_start.message.usage + message_delta.usage. OpenAI Responses: response.usage. */
 export function usageFromSseEvent(event) {
   if (!event || typeof event !== 'object') return null
@@ -334,8 +390,10 @@ const PERMISSION_ERROR_TEXT = /organization does not have access to claude/i
  */
 export function semanticStatusForStreamError(errorBody) {
   const type = String(errorBody?.error?.type || errorBody?.type || '')
+  const code = String(errorBody?.error?.code || errorBody?.code || '')
   const message = String(errorBody?.error?.message || errorBody?.message || '')
   if (isPlanLimitMessage(message)) return 429
+  if (isContentPolicyErrorCode(code)) return 403
   // The kernel names the status the job failed with; older kernels did not.
   // Codex Responses Lite error events put it on the outer object (`{type,status,error}`).
   const explicit = Number(errorBody?.error?.status ?? errorBody?.status)
@@ -504,7 +562,7 @@ export async function callGoWorker({
   exec,
   body,
   reqHeaders = {},
-  timeoutMs,
+  timeoutMs = 180000,
   identity = null,
   signal,
   want1m = false,
@@ -594,19 +652,24 @@ export async function streamGoWorker({
   exec,
   body,
   reqHeaders = {},
-  timeoutMs,
+  timeoutMs = 180000,
   idleTimeoutMs = 0,
+  overallTimeoutMs = 0,
   identity = null,
   signal,
   deliveryMode = 'realtime',
   onEvent,
+  onEventBatch,
   onCommit,
+  onResponse,
+  onAccepted,
   want1m = false,
   cacheTtl = null,
   preserveCacheBreakpoints = null,
   requestPath = '/internal/v1/messages',
   envelope = null,
   cliHop = false,
+  sseEventMode = null,
 } = {}) {
   if (isCrsMock()) {
     const { body: outboundBody, headers } = finalizeWorkerPayload({ body, reqHeaders, exec, identity, want1m, cliHop })
@@ -684,6 +747,23 @@ export async function streamGoWorker({
   const startedAt = Date.now()
   let ttftMs = null
   const requestId = randomUUID()
+  const overallMs = Math.max(0, Number(overallTimeoutMs) || 0)
+  const deadlineController = overallMs > 0 ? new AbortController() : null
+  const workerSignal = deadlineController
+    ? signal
+      ? AbortSignal.any([signal, deadlineController.signal])
+      : deadlineController.signal
+    : signal
+  let deadlineExpired = false
+  let deadlineTimer = null
+  if (deadlineController) {
+    deadlineTimer = setTimeout(() => {
+      deadlineExpired = true
+      requestKernelCancel(exec, requestId)
+      deadlineController.abort()
+    }, overallMs)
+    deadlineTimer.unref?.()
+  }
   const stopCancel = cancelOnAbort(exec, signal, requestId)
   try {
     const response = await workerRequest(exec, {
@@ -706,12 +786,15 @@ export async function streamGoWorker({
           })),
         request_id: requestId,
       },
-      signal,
+      signal: workerSignal,
       timeoutMs,
       timeoutMode: 'first-byte',
       headers: { te: 'trailers' },
     })
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
+    if (typeof onResponse === 'function') {
+      await onResponse({ status: response.statusCode || 0, headers })
+    }
     if ((response.statusCode || 0) < 200 || (response.statusCode || 0) >= 300) {
       const data = await readAll(response, 1024 * 1024)
       return restoreKernelErrorStatus({
@@ -732,32 +815,50 @@ export async function streamGoWorker({
     let sseModel = null
     let sseStop = null
     let sseRateHeaders = {}
-    const assembler = createClaudeMessageAssembler()
+    let upstreamAccepted = false
+    const responsesPassthrough = sseEventMode === 'responses-passthrough'
+    const assembler = responsesPassthrough ? null : createClaudeMessageAssembler()
+    const batchEvents = responsesPassthrough && typeof onEventBatch === 'function'
     const pendingLines = []
     const takeSseEvent = () => {
       try {
-        const event = JSON.parse(dataBuf)
+        const event = parseWorkerSseEvent(dataBuf, sseEventMode)
         dataBuf = ''
         return event && typeof event === 'object' ? event : null
       } catch {
         return null
       }
     }
-    const flushCommit = async () => {
-      if (committed) return
-      committed = true
-      if (typeof onCommit === 'function') onCommit()
-      if (onEvent) {
-        for (const queued of pendingLines) await onEvent(queued)
-      }
-      pendingLines.length = 0
-    }
-    const emitLine = async (line) => {
-      if (!committed) {
-        pendingLines.push(line)
+    const dispatchEntries = async (entries) => {
+      if (!entries.length) return
+      if (batchEvents) {
+        await onEventBatch(entries)
         return
       }
-      if (onEvent) await onEvent(line)
+      if (onEvent) {
+        for (const entry of entries) await onEvent(entry.line, entry.event)
+      }
+    }
+    const flushCommit = (batch = null) => {
+      if (committed) return null
+      committed = true
+      if (typeof onCommit === 'function') onCommit()
+      const pending = pendingLines.splice(0)
+      if (batch) batch.push(...pending)
+      const delivery = batch ? null : dispatchEntries(pending)
+      return delivery
+    }
+    const emitLine = (line, event = null, batch = null) => {
+      const entry = { line, event }
+      if (!committed) {
+        pendingLines.push(entry)
+        return null
+      }
+      if (batch) {
+        batch.push(entry)
+        return null
+      }
+      return dispatchEntries([entry])
     }
     const observeSseEvent = (event) => {
       if (!event) return event
@@ -767,6 +868,11 @@ export async function streamGoWorker({
       }
       if (event.type === 'error') lastError = event
       if (event.type === 'message_stop') sawMessageStop = true
+      if (event.type === 'response.completed' || event.type === 'response.done') sawResponseTerminal = true
+      if (isUpstreamAcceptedEvent(event)) {
+        upstreamAccepted = true
+        if (typeof onAccepted === 'function') onAccepted(event)
+      }
       const evUsage = usageFromSseEvent(event)
       if (evUsage) sseUsage = mergeUsage(sseUsage, evUsage)
       if (event.message?.model) sseModel = event.message.model
@@ -777,15 +883,19 @@ export async function streamGoWorker({
     const firstByteMs = Math.max(0, Number(timeoutMs) || 0)
     const idleMs = Math.max(0, Number(idleTimeoutMs) || 0)
     let lastChunkAt = Date.now()
-    let sawChunk = false
     let sawMessageStop = false
+    let sawResponseTerminal = false
     let idleTimer = null
     if (firstByteMs > 0 || idleMs > 0) {
       idleTimer = setInterval(() => {
-        const limit = sawChunk ? idleMs : firstByteMs
+        // Kernel metadata (rate limits / response headers) proves the local
+        // socket is alive, but it does not mean OpenAI accepted the turn. Keep
+        // the longer first-event deadline until a real lifecycle frame arrives.
+        const limit = upstreamAccepted ? idleMs : firstByteMs
         if (limit <= 0) return
-        if (Date.now() - lastChunkAt < limit) return
-        const which = sawChunk ? 'idle' : 'first-byte'
+        const activeAt = upstreamAccepted ? lastChunkAt : startedAt
+        if (Date.now() - activeAt < limit) return
+        const which = upstreamAccepted ? 'idle' : 'first-event'
         response.destroy(
           Object.assign(new Error(`slot worker ${which} timeout after ${limit}ms`), { code: 'worker_timeout' }),
         )
@@ -797,50 +907,73 @@ export async function streamGoWorker({
       // job_done and its trailers afterward. Keep reading until the worker
       // closes the response so a normal completion is not mistaken for cancel.
       for await (const chunk of response) {
-        sawChunk = true
+        const eventBatch = batchEvents ? [] : null
         lastChunkAt = Date.now()
         buffer += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)
         let newline
         while ((newline = buffer.indexOf('\n')) >= 0) {
           const line = buffer.slice(0, newline).replace(/\r$/, '')
           buffer = buffer.slice(newline + 1)
-          applyClaudeSSELineToMessage(line, assembler)
+          if (assembler) applyClaudeSSELineToMessage(line, assembler)
+          let parsedEvent = null
           if (line.startsWith('data:')) {
             const piece = line.slice(5).trim()
             if (piece && piece !== '[DONE]') {
               dataBuf = dataBuf ? `${dataBuf}\n${piece}` : piece
-              const event = observeSseEvent(takeSseEvent())
-              if (isDownstreamCommitEvent(event)) await flushCommit()
+              parsedEvent = observeSseEvent(takeSseEvent())
+              if (isDownstreamCommitEvent(parsedEvent)) {
+                const delivery = flushCommit(eventBatch)
+                if (delivery) await delivery
+              }
             }
           } else if (line === '') {
             if (dataBuf) {
               const event = takeSseEvent()
               dataBuf = ''
               observeSseEvent(event)
-              if (isDownstreamCommitEvent(event)) await flushCommit()
+              if (isDownstreamCommitEvent(event)) {
+                const delivery = flushCommit(eventBatch)
+                if (delivery) await delivery
+              }
             }
           } else if (dataBuf && !line.startsWith('event:') && !line.startsWith(':')) {
             dataBuf = `${dataBuf}\n${line}`
             const event = observeSseEvent(takeSseEvent())
-            if (isDownstreamCommitEvent(event)) await flushCommit()
+            if (isDownstreamCommitEvent(event)) {
+              const delivery = flushCommit(eventBatch)
+              if (delivery) await delivery
+            }
           }
-          await emitLine(line)
+          const delivery = emitLine(line, parsedEvent, eventBatch)
+          if (delivery) await delivery
         }
+        if (eventBatch?.length) await dispatchEntries(eventBatch)
       }
+      const finalBatch = batchEvents ? [] : null
       if (buffer) {
-        applyClaudeSSELineToMessage(buffer, assembler)
-        await emitLine(buffer)
+        if (assembler) applyClaudeSSELineToMessage(buffer, assembler)
+        const delivery = emitLine(buffer, null, finalBatch)
+        if (delivery) await delivery
       }
       if (dataBuf) {
         const event = observeSseEvent(takeSseEvent())
-        if (isDownstreamCommitEvent(event)) await flushCommit()
+        if (isDownstreamCommitEvent(event)) {
+          const delivery = flushCommit(finalBatch)
+          if (delivery) await delivery
+        }
       }
       const trailers = mergeRateLimitHeaders(publicHeaders(response.trailers))
       const meta = streamMetaFromHeaders({ ...headers, ...trailers })
-      const assembled = assembler.message
+      const assembled = assembler?.message || null
       const stopReason = meta.stopReason || sseStop || assembled?.stop_reason || null
-      const complete = !lastError && isCompleteAssistantMessage({ body: assembled, stopReason, sawMessageStop })
-      if (!committed && complete) await flushCommit()
+      const complete =
+        !lastError &&
+        (sawResponseTerminal || isCompleteAssistantMessage({ body: assembled, stopReason, sawMessageStop }))
+      if (!committed && complete) {
+        const delivery = flushCommit(finalBatch)
+        if (delivery) await delivery
+      }
+      if (finalBatch?.length) await dispatchEntries(finalBatch)
       const terminalState = complete ? 'verified' : 'incomplete'
       const rateHeaders = mergeRateLimitHeaders({ ...sseRateHeaders, ...headers, ...trailers })
       return restoreUncommittedHop({
@@ -848,7 +981,10 @@ export async function streamGoWorker({
         status: response.statusCode || 0,
         via: 'go-worker-stream',
 
-        body: lastError || assembled || { type: 'message', role: 'assistant', content: [] },
+        body:
+          lastError ||
+          assembled ||
+          (responsesPassthrough ? { type: 'response' } : { type: 'message', role: 'assistant', content: [] }),
         headers: rateHeaders,
         // Trailer stays authoritative, but it may carry totals only (Codex/Responses hops).
         // Merge so SSE `input_tokens_details` / cache breakdown survives instead of being short-circuited.
@@ -874,6 +1010,27 @@ export async function streamGoWorker({
         committed,
       })
     }
+    if (deadlineExpired) {
+      return {
+        ok: false,
+        status: 504,
+        via: 'go-worker-stream',
+        body: {
+          type: 'error',
+          error: {
+            type: 'timeout_error',
+            code: 'kernel_retry_deadline',
+            message: `kernel stream exceeded the ${overallMs}ms overall deadline`,
+          },
+        },
+        headers: {},
+        ttftMs,
+        firstTokenAt: ttftMs == null ? null : startedAt + ttftMs,
+        committed,
+        terminalState: committed ? 'incomplete' : 'transport_error',
+        transportError: true,
+      }
+    }
     return {
       ok: false,
       status: 0,
@@ -894,6 +1051,7 @@ export async function streamGoWorker({
       transportError: true,
     }
   } finally {
+    if (deadlineTimer) clearTimeout(deadlineTimer)
     stopCancel()
   }
 }

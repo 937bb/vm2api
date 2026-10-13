@@ -15,9 +15,12 @@ export const LIVE_CREDENTIAL_CACHE_MS = 3000
 const MIRROR_NEWER_MS = 2000
 
 let cache = { at: 0, map: null }
+let cacheEpoch = 0
+let inFlight = null
 
 export function invalidateLiveCredentialCache() {
   cache = { at: 0, map: null }
+  cacheEpoch += 1
 }
 
 function mapPool(items, concurrency, fn) {
@@ -99,27 +102,38 @@ export async function collectLivePanelCredentials(
 ) {
   const now = Date.now()
   if (cache.map && cacheMs > 0 && now - cache.at < cacheMs) return cache.map
-  const list = Array.isArray(vms) ? vms.filter((vm) => vm?.id) : []
-  const map = new Map()
-  await mapPool(list, concurrency, async (vm) => {
-    const exec = slotExec(projectRoot, vm)
-    if (!exec) return
-    const file = readSlotCredentialIdentity(exec.homeDir)
-    let health = null
-    try {
-      health = await rustKernelHealth(exec, { timeoutMs })
-    } catch (error) {
-      health = { ok: false, code: 'worker_unavailable', error: String(error.message || error) }
-    }
-    const live = publicLiveCredential(health, file)
-    if (!live.has_access && !live.has_refresh && !live.expires_at) return
-    map.set(vm.id, live)
-    if (shouldMirror(vm, live) && exec.homeDir) {
+  const epoch = cacheEpoch
+  if (cacheMs > 0 && inFlight?.epoch === epoch) return inFlight.promise
+  const promise = (async () => {
+    const list = Array.isArray(vms) ? vms.filter((vm) => vm?.id) : []
+    const map = new Map()
+    await mapPool(list, concurrency, async (vm) => {
+      const exec = slotExec(projectRoot, vm)
+      if (!exec) return
+      const file = readSlotCredentialIdentity(exec.homeDir)
+      let health = null
       try {
-        mirrorWorkerCredentialsToVm(vmJsonPath(projectRoot, vm.id), exec.homeDir)
-      } catch {}
-    }
-  })
-  cache = { at: Date.now(), map }
-  return map
+        health = await rustKernelHealth(exec, { timeoutMs })
+      } catch (error) {
+        health = { ok: false, code: 'worker_unavailable', error: String(error.message || error) }
+      }
+      const live = publicLiveCredential(health, file)
+      if (!live.has_access && !live.has_refresh && !live.expires_at) return
+      map.set(vm.id, live)
+      if (shouldMirror(vm, live) && exec.homeDir) {
+        try {
+          mirrorWorkerCredentialsToVm(vmJsonPath(projectRoot, vm.id), exec.homeDir)
+        } catch {}
+      }
+    })
+    if (epoch === cacheEpoch) cache = { at: Date.now(), map }
+    return map
+  })()
+  if (cacheMs <= 0) return promise
+  inFlight = { epoch, promise }
+  try {
+    return await promise
+  } finally {
+    if (inFlight?.promise === promise) inFlight = null
+  }
 }

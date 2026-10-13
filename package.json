@@ -21,6 +21,7 @@
     "format:check": "biome format && node scripts/check-gofmt.mjs && pnpm -C web format:check"
   },
   "dependencies": {
+    "@redis/client": "^6.3.0",
     "https-proxy-agent": "^9.1.0",
     "node-fetch": "^2.7.0",
     "socks-proxy-agent": "^10.1.0",

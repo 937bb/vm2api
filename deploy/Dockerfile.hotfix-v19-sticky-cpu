@@ -1,0 +1,4 @@
+FROM vm2api-local:v1.3.148-hotfix-503-v18
+
+COPY src/lib/pool/sticky-router.mjs /opt/vm2api/src/lib/pool/sticky-router.mjs
+COPY src/lib/protocol/handle-codex.mjs /opt/vm2api/src/lib/protocol/handle-codex.mjs

@@ -94,6 +94,7 @@ export class BackupService {
     this._running = false
     this._timer = null
     this._bootTimer = null
+    this._beforeRestore = null
     this._rebindStores = null // set via onRestored()
   }
 
@@ -117,6 +118,11 @@ export class BackupService {
   /** Register the callback that re-binds stores to the new DB after restore. */
   onRestored(fn) {
     this._rebindStores = typeof fn === 'function' ? fn : null
+  }
+
+  /** Drain in-memory write queues while the live DB connection is still open. */
+  onBeforeRestore(fn) {
+    this._beforeRestore = typeof fn === 'function' ? fn : null
   }
 
   // ---------- schedule config ----------
@@ -363,6 +369,8 @@ export class BackupService {
     this.isRestoring = true
     let tmp = null
     try {
+      if (this._beforeRestore) this._beforeRestore()
+
       // 0. safety net snapshot of the current state
       const pre = this.createBackup({ kind: 'pre_restore', note: `before restore of ${rec.id}` })
 

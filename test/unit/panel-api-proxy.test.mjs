@@ -145,6 +145,39 @@ test('dashboard and vm list report the slot form and fixed machine spec', async 
   }
 })
 
+test('overview dashboard skips billing and log aggregates from the first paint path', async () => {
+  const project = tmpDir()
+  fs.mkdirSync(path.join(project, 'data'), { recursive: true })
+  writeVm(project, { id: 'vm-overview', status: 'stopped', claude: {} })
+  const cfg = { paths: { project }, rewrite: { enabled: false }, base_url: 'http://127.0.0.1' }
+  const requestLog = {
+    billingStats() {
+      throw new Error('overview must not read billing')
+    },
+    totals() {
+      throw new Error('overview must not read totals')
+    },
+    windowStats() {
+      throw new Error('overview must not read ops')
+    },
+  }
+  const dash = await buildDashboard({
+    cfg,
+    accountQuota: fakeQuota(),
+    stickyRouter: { stats: () => ({ active_sessions: 0 }) },
+    routingConfig: {},
+    stats: {},
+    requestLog,
+    includeHeavyStats: false,
+  })
+
+  assert.equal(dash.ok, true)
+  assert.equal(dash.data.billing, undefined)
+  assert.equal(dash.data.db_totals, undefined)
+  assert.equal(dash.data.ops, undefined)
+  assert.equal(dash.data.vms.length, 1)
+})
+
 test('dead bound proxy blocks credential import', async () => {
   const project = tmpDir()
   const dataDir = path.join(project, 'data')

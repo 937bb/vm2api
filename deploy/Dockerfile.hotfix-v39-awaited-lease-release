@@ -1,0 +1,7 @@
+FROM vm2api-local:v1.3.153-hotfix-v38-global-lease-retirement
+LABEL org.opencontainers.image.version="1.3.153-hotfix-v39-awaited-lease-release"
+
+COPY src/lib/protocol/handle-codex.mjs /opt/vm2api/src/lib/protocol/handle-codex.mjs
+
+RUN printf '%s\n' '1.3.153-hotfix-v39-awaited-lease-release' > /opt/vm2api/VERSION
+ENV VM2API_BUILD=1.3.153-hotfix-v39-awaited-lease-release

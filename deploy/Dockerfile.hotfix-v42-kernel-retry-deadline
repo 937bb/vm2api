@@ -1,0 +1,12 @@
+FROM vm2api-local:v1.3.153-hotfix-v41-coalesced-capacity-wake
+LABEL org.opencontainers.image.version="1.3.153-hotfix-v42-kernel-retry-deadline"
+
+COPY src/lib/transport/go-worker-client.mjs /opt/vm2api/src/lib/transport/go-worker-client.mjs
+COPY src/lib/protocol/handle-codex.mjs /opt/vm2api/src/lib/protocol/handle-codex.mjs
+COPY scripts/patch-codex-kernel-retry.mjs /tmp/patch-codex-kernel-retry.mjs
+RUN node /tmp/patch-codex-kernel-retry.mjs /opt/vm2api/image-bin/kin-codex-kernel \
+    && rm /tmp/patch-codex-kernel-retry.mjs \
+    && printf '%s\n' '1.3.153-hotfix-v42-kernel-retry-deadline' > /opt/vm2api/VERSION
+
+ENV VM2API_BUILD=1.3.153-hotfix-v42-kernel-retry-deadline \
+    KIN_CODEX_STREAM_DEADLINE_MS=300000

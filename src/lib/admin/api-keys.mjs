@@ -487,7 +487,7 @@ export class ApiKeyStore {
 
   recordUsage(recOrId, usage = {}, { model = null, rateMultiplier = 1 } = {}) {
     const id = typeof recOrId === 'string' ? recOrId : recOrId?.id
-    if (!this.repo.getById(id)) return null
+    if (!id) return null
     let cost = Number(usage.cost ?? usage.actual_cost) || 0
     if (!cost && model) {
       try {
@@ -506,10 +506,6 @@ export class ApiKeyStore {
       cache_creation_tokens: Number(normalized.cache_creation_input_tokens ?? normalized.cache_creation_tokens) || 0,
       cost,
     })
-    // sub2api: the billing write flips the key when the USD quota runs out
-    if (rec && rec.status === 'active' && (rec.quota ?? 0) > 0 && (rec.quota_used ?? 0) >= rec.quota) {
-      this.repo.update({ ...rec, status: 'quota_exhausted', updated_at: nowIso() })
-    }
     return rec
   }
 

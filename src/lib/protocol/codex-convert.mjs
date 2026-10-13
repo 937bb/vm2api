@@ -258,6 +258,7 @@ function stripUnsupportedCodexFields(body = {}) {
   delete next.max_output_tokens
   delete next.max_tokens
   delete next.temperature
+  delete next.top_p
   delete next.prompt_cache_retention
   const effort = normalizeCodexReasoningEffort(next.reasoning?.effort || next.reasoning_effort)
   delete next.reasoning_effort
@@ -464,17 +465,27 @@ function parseSseData(line) {
  */
 export function createResponsesSseEventNamer() {
   let held = null
-  return (line) => {
+  let emittedDelimiter = false
+  return (line, parsedEvent = null) => {
     const raw = String(line ?? '')
+    if (raw === '') {
+      if (emittedDelimiter) {
+        emittedDelimiter = false
+        return ''
+      }
+      return '\n'
+    }
+    emittedDelimiter = false
     if (raw.startsWith('event:')) {
       held = raw
       return ''
     }
     if (!raw.startsWith('data:')) return `${raw}\n`
-    const type = parseSseData(raw).event?.type
+    const type = parsedEvent?.type || parseSseData(raw).event?.type
     const name = typeof type === 'string' && type ? `event: ${type}` : held
     held = null
-    return name ? `${name}\n${raw}\n` : `${raw}\n`
+    emittedDelimiter = true
+    return name ? `${name}\n${raw}\n\n` : `${raw}\n\n`
   }
 }
 

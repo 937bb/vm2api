@@ -4,7 +4,7 @@
  * quota/auth before any SSE byte is committed.
  */
 import { isCodexVm } from '../vm/vm-kind.mjs'
-import { extraToCodexSnapshot, normalizeCodexLimits, codexQuotaPark } from '../protocol/codex-usage.mjs'
+import { codexQuotaParkFromLimits, extraToCodexSnapshot, normalizeCodexLimits } from '../protocol/codex-usage.mjs'
 import { isLeftoverQuotaScheduleOff, isQuotaWindowReason } from './availability.mjs'
 import { orderOpenAIAccounts } from './openai-account-selector.mjs'
 import { bumpOpenAICursor, openAIRuntimeSignals, readOpenAICursor } from './openai-account-runtime.mjs'
@@ -26,14 +26,7 @@ export function isCodexSlotReady(vm) {
 }
 
 export function isCodexSlotParked(vm, now = Date.now(), policy = null) {
-  const until = Date.parse(vm?.codex_limited_until || '')
-  if (Number.isFinite(until) && until > now) return true
-  return extraPark(vm, now).limited || evaluateOpenAIQuotaGate(vm, policy || {}, now).limited
-}
-
-function extraPark(vm, now) {
-  const extra = extraFromSummary(vm)
-  return codexQuotaPark(extra, now)
+  return buildCodexSlotSnapshot(vm, now, normalizeOpenAIQuotaPolicy(policy)).parked
 }
 
 function extraFromSummary(vm) {
@@ -55,93 +48,53 @@ function extraFromSummary(vm) {
   }
 }
 
-function stressOf(vm) {
-  const u5 = Number(vm?.utilization_5h)
-  const u7 = Number(vm?.utilization_7d)
-  if (!Number.isFinite(u5) && !Number.isFinite(u7)) {
-    const limits = normalizeCodexLimits(extraToCodexSnapshot(extraFromSummary(vm)))
-    const p5 = Number(limits.used_5h_percent)
-    const p7 = Number(limits.used_7d_percent)
-    const a = Number.isFinite(p5) ? p5 / 100 : 0
-    const b = Number.isFinite(p7) ? p7 / 100 : 0
-    return Math.max(a, b)
-  }
-  return Math.max(Number.isFinite(u5) ? u5 : 0, Number.isFinite(u7) ? u7 : 0)
-}
-
-function parkUntil(vm, now) {
-  const until = Date.parse(vm?.codex_limited_until || '')
-  if (Number.isFinite(until)) return until
-  return extraPark(vm, now).until || now
-}
-
-/**
- * Ordered candidate ids. Pinned master hops stay on that slot.
- * Ready slots first (lowest 5h/7d stress), parked slots last so a
- * total-exhaust pool still has somewhere to fail instead of 503.
- */
-export function pickCodexSlots(vms, { pin = null, now = Date.now(), quotaPolicy = null } = {}) {
-  const list = Array.isArray(vms) ? vms : []
-  if (pin) {
-    const vm = list.find((item) => item?.id === pin) || null
-    if (!vm || !isCodexVm(vm)) return { error: 'platform_mismatch', pin, ids: [], ready: [], parked: [] }
-    const blocked = proxyBlockedReason(vm.proxy)
-    if (blocked) return { error: blocked, pin, ids: [], ready: [], parked: [] }
-    return { ids: [vm.id], pin, ready: [vm.id], parked: [] }
-  }
-  const ready = []
-  const parked = []
-  for (const vm of list) {
-    if (!isCodexSlotReady(vm)) continue
-    if (isCodexSlotParked(vm, now, quotaPolicy)) parked.push(vm)
-    else ready.push(vm)
-  }
-  ready.sort((a, b) => {
-    const d = stressOf(a) - stressOf(b)
-    return d !== 0 ? d : String(a.id).localeCompare(String(b.id))
-  })
-  parked.sort((a, b) => {
-    const d = parkUntil(a, now) - parkUntil(b, now)
-    return d !== 0 ? d : String(a.id).localeCompare(String(b.id))
-  })
-  const ids = [...ready, ...parked].map((vm) => vm.id)
-  if (!ids.length) return { error: 'no_codex_vm', ids: [], ready: [], parked: [] }
-  return {
-    ids,
-    ready: ready.map((vm) => vm.id),
-    parked: parked.map((vm) => vm.id),
-  }
-}
-
-function quotaRemainingRank(vm) {
-  const u5 = Number(vm?.utilization_5h)
-  const u7 = Number(vm?.utilization_7d)
-  let used = null
-  if (Number.isFinite(u5) || Number.isFinite(u7)) {
-    used = Math.max(Number.isFinite(u5) ? u5 : 0, Number.isFinite(u7) ? u7 : 0)
-  } else {
-    const limits = normalizeCodexLimits(extraToCodexSnapshot(extraFromSummary(vm)))
-    const p5 = Number(limits.used_5h_percent)
-    const p7 = Number(limits.used_7d_percent)
-    if (Number.isFinite(p5) || Number.isFinite(p7)) {
-      used = Math.max(Number.isFinite(p5) ? p5 / 100 : 0, Number.isFinite(p7) ? p7 / 100 : 0)
-    }
-  }
-  if (used == null) return null
-  return Math.round((1 - Math.min(1, Math.max(0, used))) * 10_000)
-}
-
-function quotaResetAt(vm) {
+function usageState(vm, now) {
   const extra = extraFromSummary(vm)
   const limits = normalizeCodexLimits(extraToCodexSnapshot(extra))
-  const resets = [limits.reset_5h_at, limits.reset_7d_at, vm?.reset_5h, vm?.reset_7d]
-    .map((value) => Date.parse(value || ''))
-    .filter((value) => Number.isFinite(value))
-  if (!resets.length) return null
-  return Math.min(...resets)
+  const u5 = Number(vm?.utilization_5h)
+  const u7 = Number(vm?.utilization_7d)
+  const p5 = Number(limits.used_5h_percent)
+  const p7 = Number(limits.used_7d_percent)
+  const hasVmUsage = Number.isFinite(u5) || Number.isFinite(u7)
+  const used = hasVmUsage
+    ? Math.max(Number.isFinite(u5) ? u5 : 0, Number.isFinite(u7) ? u7 : 0)
+    : Number.isFinite(p5) || Number.isFinite(p7)
+      ? Math.max(Number.isFinite(p5) ? p5 / 100 : 0, Number.isFinite(p7) ? p7 / 100 : 0)
+      : null
+  const reset5At = Date.parse(limits.reset_5h_at || '')
+  const reset7At = Date.parse(limits.reset_7d_at || '')
+  const park = codexQuotaParkFromLimits(limits, extra.codex_limited_until, now)
+  const live5 = Number.isFinite(p5) && p5 >= 100 && (!Number.isFinite(reset5At) || reset5At > now)
+  const live7 = Number.isFinite(p7) && p7 >= 100 && (!Number.isFinite(reset7At) || reset7At > now)
+  const quotaWindowReason = live5
+    ? 'quota_5h_header'
+    : live7
+      ? 'quota_7d_header'
+      : park.limited
+        ? 'quota_5h_header'
+        : null
+  const vmReset5 = Date.parse(vm?.reset_5h || '')
+  const vmReset7 = Date.parse(vm?.reset_7d || '')
+  let quotaResetAt = null
+  for (const at of [reset5At, reset7At, vmReset5, vmReset7]) {
+    if (Number.isFinite(at) && (quotaResetAt == null || at < quotaResetAt)) quotaResetAt = at
+  }
+  const restrictionTimes = [reset5At, reset7At, Date.parse(extra.codex_limited_until || '')].filter(
+    (value) => Number.isFinite(value) && value > now,
+  )
+  return {
+    extra,
+    limits,
+    park,
+    quotaWindowReason,
+    restrictionUntil: restrictionTimes.length ? Math.min(...restrictionTimes) : now + 5 * 60_000,
+    stress: used ?? 0,
+    quotaRemainingRank: used == null ? null : Math.round((1 - Math.min(1, Math.max(0, used))) * 10_000),
+    quotaResetAt,
+  }
 }
 
-export function codexAccountStatus(vm, now = Date.now(), policy = null) {
+function statusOf(vm, parked, quotaWindowReason) {
   if (!vm || !isCodexVm(vm)) return 'error'
   if (proxyBlockedReason(vm.proxy)) return 'disabled'
   if (vm.schedulable === false && !isLeftoverQuotaScheduleOff(vm)) return 'disabled'
@@ -149,8 +102,111 @@ export function codexAccountStatus(vm, now = Date.now(), policy = null) {
   if (status === 'disabled') return 'disabled'
   if (status === 'dead' || status === 'error') return 'error'
   if (!vm.has_token) return 'error'
-  if (isCodexSlotParked(vm, now, policy) || codexQuotaWindowReason(vm, now)) return 'quota_exhausted'
+  if (parked || quotaWindowReason) return 'quota_exhausted'
   return 'normal'
+}
+
+function buildCodexSlotSnapshot(vm, now, policy) {
+  const usage = usageState(vm, now)
+  const rawExtra = vm?.codex?.extra || vm?.codex_extra
+  const prepared =
+    rawExtra === usage.extra && rawExtra && typeof rawExtra === 'object' && Object.keys(rawExtra).length
+      ? { extra: rawExtra, limits: usage.limits }
+      : null
+  const localGate = evaluateOpenAIQuotaGate(vm, policy, now, prepared)
+  const explicitLimitAt = Date.parse(vm?.codex_limited_until || '')
+  const parked = (Number.isFinite(explicitLimitAt) && explicitLimitAt > now) || usage.park.limited || localGate.limited
+  return {
+    vm,
+    usage,
+    localGate,
+    parked,
+    parkUntil: Number.isFinite(explicitLimitAt) ? explicitLimitAt : usage.park.until || now,
+    status: statusOf(vm, parked, usage.quotaWindowReason),
+    effective: effectiveOpenAIPolicy(vm, policy),
+  }
+}
+
+/**
+ * Ordered candidate ids. Pinned master hops stay on that slot.
+ * Ready slots first (lowest 5h/7d stress), parked slots last so a
+ * total-exhaust pool still has somewhere to fail instead of 503.
+ */
+function sameQuotaPolicy(left, right) {
+  return (
+    left?.limit_5h === right?.limit_5h &&
+    left?.limit_7d === right?.limit_7d &&
+    left?.max_concurrency === right?.max_concurrency &&
+    left?.max_rpm === right?.max_rpm &&
+    left?.max_sessions === right?.max_sessions
+  )
+}
+
+function reusableSnapshotEntries(snapshotCache, policy, now) {
+  if (!(snapshotCache?.entries instanceof Map) || Number(snapshotCache.expiresAt) <= now) return null
+  if (!snapshotCache.policy) snapshotCache.policy = policy
+  else if (!sameQuotaPolicy(snapshotCache.policy, policy)) {
+    snapshotCache.entries.clear()
+    snapshotCache.policy = policy
+  }
+  return snapshotCache.entries
+}
+
+function slotSnapshot(vm, now, policy, entries) {
+  const cached = entries?.get(vm?.id)
+  if (cached?.vm === vm) return cached
+  const snapshot = buildCodexSlotSnapshot(vm, now, policy)
+  entries?.set(vm.id, snapshot)
+  return snapshot
+}
+
+function analyzeCodexSlots(vms, { pin = null, now = Date.now(), quotaPolicy = null, snapshotCache = null } = {}) {
+  const list = Array.isArray(vms) ? vms : []
+  const policy = normalizeOpenAIQuotaPolicy(quotaPolicy)
+  const snapshots = reusableSnapshotEntries(snapshotCache, policy, now) || new Map()
+  if (pin) {
+    const vm = list.find((item) => item?.id === pin) || null
+    if (!vm || !isCodexVm(vm)) {
+      return { result: { error: 'platform_mismatch', pin, ids: [], ready: [], parked: [] }, snapshots, policy }
+    }
+    const blocked = proxyBlockedReason(vm.proxy)
+    if (blocked) return { result: { error: blocked, pin, ids: [], ready: [], parked: [] }, snapshots, policy }
+    slotSnapshot(vm, now, policy, snapshots)
+    return { result: { ids: [vm.id], pin, ready: [vm.id], parked: [] }, snapshots, policy }
+  }
+  const ready = []
+  const parked = []
+  for (const vm of list) {
+    if (!isCodexSlotReady(vm)) continue
+    const snapshot = slotSnapshot(vm, now, policy, snapshots)
+    if (snapshot.parked) parked.push(snapshot)
+    else ready.push(snapshot)
+  }
+  ready.sort((a, b) => {
+    const d = a.usage.stress - b.usage.stress
+    return d !== 0 ? d : String(a.vm.id).localeCompare(String(b.vm.id))
+  })
+  parked.sort((a, b) => {
+    const d = a.parkUntil - b.parkUntil
+    return d !== 0 ? d : String(a.vm.id).localeCompare(String(b.vm.id))
+  })
+  const ids = [...ready, ...parked].map((snapshot) => snapshot.vm.id)
+  const result = ids.length
+    ? {
+        ids,
+        ready: ready.map((snapshot) => snapshot.vm.id),
+        parked: parked.map((snapshot) => snapshot.vm.id),
+      }
+    : { error: 'no_codex_vm', ids: [], ready: [], parked: [] }
+  return { result, snapshots, policy }
+}
+
+export function pickCodexSlots(vms, options = {}) {
+  return analyzeCodexSlots(vms, options).result
+}
+
+export function codexAccountStatus(vm, now = Date.now(), policy = null) {
+  return buildCodexSlotSnapshot(vm, now, normalizeOpenAIQuotaPolicy(policy)).status
 }
 
 /** Panel allowlist on a GPT slot. No model or no list means allowed. */
@@ -160,8 +216,16 @@ export function codexSlotAllowsModel(vm, model) {
 }
 
 export function codexAccountCandidate(vm, now = Date.now(), signals = null, policy = null) {
+  const snapshot = buildCodexSlotSnapshot(vm, now, normalizeOpenAIQuotaPolicy(policy))
+  return candidateFromSnapshot(snapshot, now, signals)
+}
+
+function candidateFromSnapshot(snapshot, now, signals = null) {
+  const vm = snapshot.vm
   const runtime = signals || openAIRuntimeSignals(vm?.id, now)
-  const effective = effectiveOpenAIPolicy(vm, normalizeOpenAIQuotaPolicy(policy))
+  const effective = snapshot.effective
+  const capacityBlockedUntil = Number(runtime.capacityBlockedUntil)
+  const recoveryBlocked = !!runtime.recoveryBlocked
   return {
     id: vm.id,
     weight: Number(vm?.policy?.weight ?? vm?.weight ?? 1) || 1,
@@ -170,13 +234,19 @@ export function codexAccountCandidate(vm, now = Date.now(), signals = null, poli
     maxSessions: effective.max_sessions,
     rpmCount: runtime.rpmCount || 0,
     rpmResetAt: runtime.rpmResetAt ?? null,
-    status: codexAccountStatus(vm, now, policy),
+    status:
+      recoveryBlocked || (Number.isFinite(capacityBlockedUntil) && capacityBlockedUntil > now)
+        ? 'capacity_busy'
+        : snapshot.status,
     inFlight: runtime.inFlight || 0,
     lastStartedAt: runtime.lastStartedAt ?? null,
-    quotaResetAt: quotaResetAt(vm),
-    quotaRemainingRank: quotaRemainingRank(vm),
+    quotaResetAt: snapshot.usage.quotaResetAt,
+    quotaRemainingRank: snapshot.usage.quotaRemainingRank,
     failureRateBps: runtime.failureRateBps || 0,
     firstOutputLatencyMs: runtime.firstOutputLatencyMs ?? null,
+    capacityBlockedUntil:
+      Number.isFinite(capacityBlockedUntil) && capacityBlockedUntil > now ? capacityBlockedUntil : null,
+    recoveryBlocked,
   }
 }
 
@@ -206,34 +276,43 @@ export function orderCodexSessionSlots(
     roundRobinCursor = null,
     model = null,
     excluded = null,
+    snapshotCache = null,
   } = {},
 ) {
-  const list = Array.isArray(vms) ? vms : []
-  const byId = new Map(list.map((vm) => [vm.id, vm]))
-  const policy = normalizeOpenAIQuotaPolicy(quotaPolicy)
-  const found = pickCodexSlots(vms, { pin, now, quotaPolicy: policy })
-  const picked = found.error ? found : withModelAllowed(found, byId, model)
+  const analysis = analyzeCodexSlots(vms, { pin, now, quotaPolicy, snapshotCache })
+  const { snapshots, policy } = analysis
+  const found = analysis.result
+  const picked = found.error ? found : withModelAllowed(found, snapshots, model)
   if (picked.error) return { ...picked, sticky: false, candidates: [] }
   const pool = picked.ids.filter((id) => !excluded?.has(id))
   if (!pool.length)
     return { error: 'candidates_exhausted', ids: [], ready: [], parked: [], sticky: false, candidates: [] }
   if (pin) {
+    const candidate = candidateFromSnapshot(snapshots.get(pin), now)
+    if (candidate.status === 'capacity_busy') {
+      return {
+        error: 'capacity_unavailable',
+        retryAt: candidate.capacityBlockedUntil,
+        ids: [],
+        ready: [],
+        parked: picked.parked || [],
+        sticky: false,
+        candidates: [],
+      }
+    }
     return {
       ...picked,
       ids: pool,
       sticky: false,
-      candidates: pool.map((id) => codexAccountCandidate(byId.get(id), now, null, policy)),
+      candidates: [candidate],
     }
   }
-  const home =
-    boundVmId && pool.includes(boundVmId) && codexAccountStatus(byId.get(boundVmId), now, policy) === 'normal'
-      ? boundVmId
-      : null
+  const home = boundVmId && pool.includes(boundVmId) && snapshots.get(boundVmId)?.status === 'normal' ? boundVmId : null
   const boundState = boundVmId ? (home ? 'live' : excluded?.has(boundVmId) ? 'excluded' : 'gone') : null
   const claimsWindow = (id) => !!sessionKey && (!home || id === home)
   const accepts = (id) => {
     if (!claimsWindow(id) || typeof sessionLimit?.canAccept !== 'function') return true
-    const cap = codexMaxSessions(byId.get(id), policy)
+    const cap = snapshots.get(id)?.effective.max_sessions || 0
     if (!cap) return true
     return sessionLimit.canAccept(id, sessionKey, { max: cap, idleMin, now }).ok !== false
   }
@@ -242,7 +321,8 @@ export function orderCodexSessionSlots(
     return { error: 'session_window_full', ids: [], ready: [], parked: [], sticky: false, boundState, candidates: [] }
   }
   const cursor = roundRobinCursor == null ? readOpenAICursor() : roundRobinCursor
-  const candidates = ids.map((id) => codexAccountCandidate(byId.get(id), now, null, policy))
+  const candidates = ids.map((id) => candidateFromSnapshot(snapshots.get(id), now))
+  const candidateById = new Map(candidates.map((candidate) => [candidate.id, candidate]))
   const ordered = orderOpenAIAccounts(candidates, {
     strategy,
     now,
@@ -252,11 +332,10 @@ export function orderCodexSessionSlots(
     roundRobinCursor: cursor,
   })
   if (!ordered.ids.length) {
-    const statuses = ids.map((id) => codexAccountStatus(byId.get(id), now, policy))
-    const quotaExhausted = statuses.length > 0 && statuses.every((status) => status === 'quota_exhausted')
+    const quotaExhausted = ids.length > 0 && ids.every((id) => snapshots.get(id)?.status === 'quota_exhausted')
     return {
       error: quotaExhausted ? 'quota_exhausted' : 'capacity_unavailable',
-      retryAt: quotaExhausted ? null : rpmRetryAt(candidates, now),
+      retryAt: quotaExhausted ? null : capacityRetryAt(candidates, now),
       ids: [],
       ready: [],
       parked: picked.parked || [],
@@ -268,16 +347,18 @@ export function orderCodexSessionSlots(
   }
   if (roundRobinCursor == null) bumpOpenAICursor()
   const sticky = ordered.preferred === 'hit' && ordered.ids[0] === boundVmId
+  const ready = new Set(picked.ready || [])
+  const orderedIds = new Set(ordered.ids)
   return {
     ...picked,
     ids: ordered.ids,
-    ready: ordered.ids.filter((id) => (picked.ready || []).includes(id)),
-    parked: (picked.parked || []).filter((id) => ordered.ids.includes(id)),
+    ready: ordered.ids.filter((id) => ready.has(id)),
+    parked: (picked.parked || []).filter((id) => orderedIds.has(id)),
     sticky,
     strategy,
     boundState,
     home,
-    candidates: ordered.ids.map((id) => candidates.find((candidate) => candidate.id === id)),
+    candidates: ordered.ids.map((id) => candidateById.get(id)),
   }
 }
 
@@ -288,17 +369,19 @@ export function codexMaxSessions(vm, policy = null) {
 }
 
 /** Earliest RPM window opening among normal slots capped only by RPM. */
-function rpmRetryAt(candidates, now) {
-  const times = candidates
+function capacityRetryAt(candidates, now) {
+  const rpmTimes = candidates
     .filter((c) => c.status === 'normal' && c.maxRpm > 0 && c.rpmCount >= c.maxRpm && c.inFlight < c.concurrency)
     .map((c) => Number(c.rpmResetAt))
     .filter((t) => Number.isFinite(t) && t > now)
+  const busyTimes = candidates.map((c) => Number(c.capacityBlockedUntil)).filter((t) => Number.isFinite(t) && t > now)
+  const times = [...rpmTimes, ...busyTimes]
   return times.length ? Math.min(...times) : null
 }
 
-function withModelAllowed(picked, byId, model) {
+function withModelAllowed(picked, snapshots, model) {
   if (!model) return picked
-  const keep = (id) => codexSlotAllowsModel(byId.get(id), model)
+  const keep = (id) => codexSlotAllowsModel(snapshots.get(id)?.vm, model)
   const ids = picked.ids.filter(keep)
   if (!ids.length) return { error: 'model_not_allowed', ids: [], ready: [], parked: [] }
   return {
@@ -314,32 +397,11 @@ export function isCodexFailoverError(result) {
   const status = Number(result.status) || 0
   const code = String(result.body?.error?.code || result.error_code || '')
   if (status === 429 || status === 401 || status === 403) return true
-  return /usage_limit_reached|upstream_auth|no_credential|sticky_unavailable/.test(code)
+  return /usage_limit_reached|upstream_auth|no_credential|no_capacity|sticky_unavailable/.test(code)
 }
 
 export function codexQuotaWindowReason(vm, now = Date.now()) {
-  const extra = extraFromSummary(vm)
-  const limits = normalizeCodexLimits(extraToCodexSnapshot(extra))
-  const used5 = Number(limits.used_5h_percent)
-  const used7 = Number(limits.used_7d_percent)
-  const reset5 = Date.parse(limits.reset_5h_at || '')
-  const reset7 = Date.parse(limits.reset_7d_at || '')
-  const live5 = Number.isFinite(used5) && used5 >= 100 && (!Number.isFinite(reset5) || reset5 > now)
-  const live7 = Number.isFinite(used7) && used7 >= 100 && (!Number.isFinite(reset7) || reset7 > now)
-  if (live5) return 'quota_5h_header'
-  if (live7) return 'quota_7d_header'
-  if (codexQuotaPark(extra, now).limited) return 'quota_5h_header'
-  return null
-}
-
-function codexRestrictionUntil(vm, now) {
-  const extra = extraFromSummary(vm)
-  const limits = normalizeCodexLimits(extraToCodexSnapshot(extra))
-  const reset5 = Date.parse(limits.reset_5h_at || '')
-  const reset7 = Date.parse(limits.reset_7d_at || '')
-  const park = Date.parse(extra.codex_limited_until || '')
-  const futures = [reset5, reset7, park].filter((value) => Number.isFinite(value) && value > now)
-  return futures.length ? Math.min(...futures) : now + 5 * 60_000
+  return usageState(vm, now).quotaWindowReason
 }
 
 function hasQuotaRestriction(vm) {
@@ -353,12 +415,13 @@ function hasQuotaRestriction(vm) {
  */
 export function evaluateCodexQuotaSchedule(vm, now = Date.now(), policy = null) {
   if (!vm || !isCodexVm(vm)) return { action: 'keep', reason: null }
-  const hardReason = codexQuotaWindowReason(vm, now)
-  const local = evaluateOpenAIQuotaGate(vm, normalizeOpenAIQuotaPolicy(policy), now)
+  const snapshot = buildCodexSlotSnapshot(vm, now, normalizeOpenAIQuotaPolicy(policy))
+  const hardReason = snapshot.usage.quotaWindowReason
+  const local = snapshot.localGate
   const reason = hardReason || (local.limited ? local.reason : null)
   const leftover = isLeftoverQuotaScheduleOff(vm)
   if (reason) {
-    const until = hardReason ? codexRestrictionUntil(vm, now) : local.until
+    const until = hardReason ? snapshot.usage.restrictionUntil : local.until
     return { action: leftover ? 'restore' : 'restrict', reason, until }
   }
   if (policy == null && /_local$/.test(vm?.claude?.temp_unschedulable_reason || vm?.temp_unschedulable_reason || '')) {

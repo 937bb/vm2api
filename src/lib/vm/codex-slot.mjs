@@ -3,7 +3,7 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
-import { atomicWriteJson, readJsonCached } from './vm-file.mjs'
+import { atomicWriteJson, invalidateReadCache, readJsonCached } from './vm-file.mjs'
 import { isCodexVm } from '../protocol/codex-route.mjs'
 import { buildCodexUsageView, extraToCodexSnapshot } from '../protocol/codex-usage.mjs'
 
@@ -30,6 +30,41 @@ export function writeCodexAccounts(projectRoot, vmId, accounts) {
     { accounts: Array.isArray(accounts) ? accounts : [] },
     { mode: 0o600 },
   )
+}
+
+function schedulingValue(value, max) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return 0
+  return Math.max(0, Math.min(max, Math.trunc(number)))
+}
+
+/**
+ * Keep the kernel-owned account limits aligned with the panel VM policy.
+ * Missing credentials stay missing; this function never creates a blank
+ * credential file and only writes when a stored value actually changed.
+ */
+export function syncCodexAccountScheduling(projectRoot, vm = {}) {
+  if (!projectRoot || !vm?.id || !isCodexVm(vm)) {
+    return { updated: false, account_count: 0, max_concurrency: 0, rpm: 0 }
+  }
+  // kin-codex-kernel owns this file too and may rewrite it without changing
+  // the cache signature (mtime, size and inode). Scheduling reconciliation
+  // must observe the kernel's latest bytes rather than a cached pre-hop copy.
+  invalidateReadCache(codexCredentialPath(projectRoot, vm.id))
+  const accounts = readCodexAccounts(projectRoot, vm.id)
+  const maxConcurrency = schedulingValue(vm.policy?.maxConcurrency, 256)
+  const rpm = schedulingValue(vm.policy?.maxRpm, 1_000_000)
+  if (!accounts.length) {
+    return { updated: false, account_count: 0, max_concurrency: maxConcurrency, rpm }
+  }
+  let updated = false
+  const next = accounts.map((account) => {
+    if (Number(account?.max_concurrency) === maxConcurrency && Number(account?.rpm) === rpm) return account
+    updated = true
+    return { ...account, max_concurrency: maxConcurrency, rpm }
+  })
+  if (updated) writeCodexAccounts(projectRoot, vm.id, next)
+  return { updated, account_count: next.length, max_concurrency: maxConcurrency, rpm }
 }
 
 function firstString(...values) {

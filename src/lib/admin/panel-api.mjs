@@ -96,6 +96,37 @@ export function ok(data, meta) {
   return out
 }
 
+function accountCacheHitStats(accounts = [], vms = []) {
+  const vmById = new Map(vms.map((vm) => [vm.id, vm]))
+  let input = 0
+  let read = 0
+  let write = 0
+  let prompt = 0
+  for (const account of accounts) {
+    const inputTokens = Number(account.tokens_in || 0)
+    const readTokens = Number(account.cache_read_tokens || 0)
+    const writeTokens = Number(account.cache_creation_tokens || 0)
+    const vm = vmById.get(account.vm_id)
+    const one = cacheHitStats({
+      input_tokens: inputTokens,
+      cache_read_tokens: readTokens,
+      cache_creation_tokens: writeTokens,
+      scheme: vm && isCodexVm(vm) ? 'openai' : 'anthropic',
+    })
+    input += inputTokens
+    read += readTokens
+    write += writeTokens
+    prompt += one.prompt_tokens
+  }
+  return {
+    input_tokens: input,
+    cache_read_tokens: read,
+    cache_creation_tokens: write,
+    prompt_tokens: prompt,
+    cache_hit_rate: prompt > 0 ? Math.min(1, read / prompt) : null,
+  }
+}
+
 /** Start/create `allocated_proxy` must never carry SOCKS credentials. */
 export function publicAllocatedProxy(proxyPool, bound, { nodeId = null, role = 'admin', nodes = [] } = {}) {
   if (!bound) return null
@@ -463,6 +494,7 @@ export async function buildDashboard({
   poolScheduler = null,
   proxyPool = null,
   clusterNodes = [],
+  includeHeavyStats = true,
 }) {
   try {
     accountQuota?.runtimeRepo?.clearExpired?.(Date.now())
@@ -504,16 +536,18 @@ export async function buildDashboard({
   ).length
   const proxy_pool = summarizeProxyPool(proxyPool)
 
-  const billing = stampVmBilling(
-    vms,
-    (() => {
-      try {
-        return attachBillingMeta(panelBillingStats(requestLog, accountQuota, vms), snap.accounts || [])
-      } catch {
-        return null
-      }
-    })(),
-  )
+  const billing = includeHeavyStats
+    ? stampVmBilling(
+        vms,
+        (() => {
+          try {
+            return attachBillingMeta(panelBillingStats(requestLog, accountQuota, vms), snap.accounts || [])
+          } catch {
+            return null
+          }
+        })(),
+      )
+    : null
 
   return ok({
     health: {
@@ -536,25 +570,19 @@ export async function buildDashboard({
       tokens_out: accounts.reduce((s, a) => s + (a.tokens_out || 0), 0),
       cache_read_tokens: accounts.reduce((s, a) => s + (a.cache_read_tokens || 0), 0),
       cache_creation_tokens: accounts.reduce((s, a) => s + (a.cache_creation_tokens || 0), 0),
-      ...cacheHitStats(
-        billing?.total || {
-          input_tokens: accounts.reduce((s, a) => s + (a.tokens_in || 0), 0),
-          cache_read_tokens: accounts.reduce((s, a) => s + (a.cache_read_tokens || 0), 0),
-          cache_creation_tokens: accounts.reduce((s, a) => s + (a.cache_creation_tokens || 0), 0),
-        },
-      ),
+      ...cacheHitStats(billing?.total || accountCacheHitStats(accounts, vms)),
       fable_max_per_account: Number(
         routingConfig?.concurrency?.fable_max_per_account ?? pool.fable_max_per_account ?? 4,
       ),
       fable_inflight: vms.reduce((n, v) => n + (Number(v.fable_inflight) || 0), 0),
-      today_cost: billing?.today?.total_cost || 0,
-      total_cost: billing?.total?.total_cost || 0,
+      today_cost: includeHeavyStats ? billing?.today?.total_cost || 0 : undefined,
+      total_cost: includeHeavyStats ? billing?.total?.total_cost || 0 : undefined,
     },
     proxy_pool,
     vms,
     routing: {
       sticky_enabled: !!routingConfig?.sticky?.enabled,
-      sticky_sessions: stickyRouter.stats()?.active_sessions ?? 0,
+      sticky_sessions: stickyRouter.activeSessionCount?.() ?? stickyRouter.stats()?.active_sessions ?? 0,
       safety_ratio: routingConfig?.quota?.safety_ratio ?? 0.85,
       weekly_safety_ratio: routingConfig?.quota?.weekly_safety_ratio ?? 0.8,
       tiers: normalizeTiers(routingConfig?.tiers, routingConfig?.quota, routingConfig?.concurrency),
@@ -564,22 +592,26 @@ export async function buildDashboard({
     },
     gateway_stats: stats,
     // historic totals straight from the request_logs table (survives restarts)
-    db_totals: (() => {
-      try {
-        return requestLog?.totals() || null
-      } catch {
-        return null
-      }
-    })(),
-    billing,
+    db_totals: includeHeavyStats
+      ? (() => {
+          try {
+            return requestLog?.totals() || null
+          } catch {
+            return null
+          }
+        })()
+      : undefined,
+    billing: includeHeavyStats ? billing : undefined,
     // last-hour ops cards (SLA / QPS / TTFT) — console can refetch other windows via /request-logs/stats
-    ops: (() => {
-      try {
-        return requestLog?.windowStats?.({ since: new Date(Date.now() - 3600_000).toISOString() }) || null
-      } catch {
-        return null
-      }
-    })(),
+    ops: includeHeavyStats
+      ? (() => {
+          try {
+            return requestLog?.windowStats?.({ since: new Date(Date.now() - 3600_000).toISOString() }) || null
+          } catch {
+            return null
+          }
+        })()
+      : undefined,
   })
 }
 
@@ -1258,13 +1290,7 @@ export function buildUsage({ accountQuota, cfg, requestLog = null }) {
       tokens_out: accounts.reduce((s, a) => s + (a.tokens_out || 0), 0),
       cache_read_tokens: accounts.reduce((s, a) => s + (a.cache_read_tokens || 0), 0),
       cache_creation_tokens: accounts.reduce((s, a) => s + (a.cache_creation_tokens || 0), 0),
-      ...cacheHitStats(
-        billing?.total || {
-          input_tokens: accounts.reduce((s, a) => s + (a.tokens_in || 0), 0),
-          cache_read_tokens: accounts.reduce((s, a) => s + (a.cache_read_tokens || 0), 0),
-          cache_creation_tokens: accounts.reduce((s, a) => s + (a.cache_creation_tokens || 0), 0),
-        },
-      ),
+      ...cacheHitStats(billing?.total || accountCacheHitStats(accounts, listed)),
       today_cost: billing?.today?.total_cost || 0,
       total_cost: billing?.total?.total_cost || 0,
       peak_5h: Math.max(0, ...accounts.map((a) => a.utilization_5h), 0),

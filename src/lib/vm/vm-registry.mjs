@@ -228,6 +228,19 @@ export function persistCodexUsage(
  * Never flips the operator switch. Leftover quota-off (not schedule_manual)
  * is restored to on + restriction.
  */
+function codexRestrictionMatches(vm, reason, until, now) {
+  const currentReason = vm?.claude?.temp_unschedulable_reason || vm?.temp_unschedulable_reason || null
+  if (currentReason !== reason) return false
+  const currentUntil = Number(vm?.claude?.temp_unschedulable_until ?? vm?.temp_unschedulable_until)
+  const desiredUntil = Number(until)
+  if (Number.isFinite(desiredUntil) && desiredUntil > 0) {
+    if (currentUntil === desiredUntil) return true
+    const isFallbackPark = Math.abs(desiredUntil - (now + 5 * 60_000)) < 10
+    return isFallbackPark && currentUntil > now
+  }
+  return !Number.isFinite(currentUntil) || currentUntil <= 0
+}
+
 export function syncCodexQuotaSchedule(projectRoot, vm, { now = Date.now(), policy = null } = {}) {
   if (!projectRoot || !vm?.id) return { action: 'keep', reason: null }
   const ev = evaluateCodexQuotaSchedule(vm, now, policy)
@@ -235,12 +248,14 @@ export function syncCodexQuotaSchedule(projectRoot, vm, { now = Date.now(), poli
   const leftover = isLeftoverQuotaScheduleOff(vm)
   if (ev.action === 'restrict' || ev.action === 'restore') {
     const until = ev.until
-    if (until == null && /_local$/.test(ev.reason || '')) clearVmQuotaRestriction(file)
-    const next = markVmRestriction(file, { until, reason: ev.reason })
-    if (next) {
-      vm.claude = next.claude
-      vm.temp_unschedulable_until = next.temp_unschedulable_until
-      vm.temp_unschedulable_reason = next.temp_unschedulable_reason
+    if (!codexRestrictionMatches(vm, ev.reason, until, now)) {
+      if (until == null && /_local$/.test(ev.reason || '')) clearVmQuotaRestriction(file)
+      const next = markVmRestriction(file, { until, reason: ev.reason })
+      if (next) {
+        vm.claude = next.claude
+        vm.temp_unschedulable_until = next.temp_unschedulable_until
+        vm.temp_unschedulable_reason = next.temp_unschedulable_reason
+      }
     }
     if (leftover) {
       setVmSchedulable(projectRoot, vm.id, true, null, { preserveStatus: true, source: 'force' })

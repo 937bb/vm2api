@@ -153,10 +153,12 @@ test('Codex hop drops max_output_tokens and keeps reasoning effort', () => {
     input: 'hello',
     max_output_tokens: 8192,
     temperature: 1,
+    top_p: 0.9,
     reasoning_effort: 'high',
   })
   assert.equal(converted.body.max_output_tokens, undefined)
   assert.equal(converted.body.temperature, undefined)
+  assert.equal(converted.body.top_p, undefined)
   assert.equal(converted.body.reasoning.effort, 'high')
 })
 
@@ -287,6 +289,7 @@ test('kernel Responses frames are re-emitted under their payload type', () => {
       '',
       'event: response.completed',
       'data: {"type":"response.completed","response":{"status":"completed"}}',
+      '',
       '',
     ].join('\n'),
   )

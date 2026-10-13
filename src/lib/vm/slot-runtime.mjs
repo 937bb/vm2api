@@ -10,7 +10,11 @@ import {
   restartRustKernel,
   writeKernelConfig,
 } from '../transport/rust-kernel-supervisor.mjs'
-import { ensureCodexKernel, stopCodexKernel, writeCodexKernelConfig } from '../transport/codex-kernel-supervisor.mjs'
+import {
+  ensureCodexKernel,
+  stopCodexKernelAndWait,
+  writeCodexKernelConfig,
+} from '../transport/codex-kernel-supervisor.mjs'
 import { runtimeKind, isKvmRuntime } from './runtime-kind.mjs'
 import { getVm, listVms, isCodexVm, persistVmRuntime } from './vm-registry.mjs'
 import { resolveInferenceEngine } from './slot-engine.mjs'
@@ -49,12 +53,19 @@ export async function startSlotReady(vm, projectRoot, opts = {}) {
 }
 
 export async function stopSlot(vm) {
-  if (isCodexVm(vm)) stopCodexKernel(vm.id)
+  if (isCodexVm(vm)) {
+    const stopped = await stopCodexKernelAndWait(vm.id)
+    if (!stopped.ok) return stopped
+  }
   return slotHost(vm).stop(vm)
 }
 
 /** Destroy the slot container. Used only by explicit reset / delete. */
 export async function destroySlot(vm) {
+  if (isCodexVm(vm)) {
+    const stopped = await stopCodexKernelAndWait(vm.id)
+    if (!stopped.ok) return stopped
+  }
   return slotHost(vm).destroy(vm)
 }
 

@@ -8,6 +8,7 @@ services:
     container_name: ${VM2API_CONTAINER_NAME:-vm2api}
     restart: unless-stopped
     init: true
+    stop_grace_period: ${VM2API_STOP_GRACE_PERIOD:-150s}
     network_mode: host
     cap_add:
       - NET_ADMIN
@@ -21,7 +22,13 @@ services:
       KIN_EGRESS_BIN: /opt/vm2api/bin/kin-egress
       KIN_WORKER_BIN: /opt/vm2api/bin/kin-worker
       KIN_CODEX_KERNEL_BIN: /opt/vm2api/bin/kin-codex-kernel
+      KIN_CODEX_KERNEL_INSTANCE: ${KIN_CODEX_KERNEL_INSTANCE:-vm2api}
+      KIN_OPENAI_REDIS_URL: ${KIN_OPENAI_REDIS_URL:-}
+      KIN_OPENAI_REDIS_REQUIRED: ${KIN_OPENAI_REDIS_REQUIRED:-1}
+      KIN_OPENAI_REDIS_POLL_BATCH: ${KIN_OPENAI_REDIS_POLL_BATCH:-32}
+      KIN_OPENAI_REDIS_COMMAND_TIMEOUT_MS: ${KIN_OPENAI_REDIS_COMMAND_TIMEOUT_MS:-10000}
       KIN_OAUTH_AUTH_BIN: /opt/vm2api/bin/kin-oauth-auth
+      KIN_SHUTDOWN_GRACE_MS: ${KIN_SHUTDOWN_GRACE_MS:-120000}
       KIN_AUTO_SYNC_WRAP: ${KIN_AUTO_SYNC_WRAP:-1}
       # 自省容器名；VM2API_HOST_ROOT 可显式覆盖宿主安装目录。
       VM2API_CONTAINER_NAME: ${VM2API_CONTAINER_NAME:-vm2api}

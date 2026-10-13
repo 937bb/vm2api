@@ -130,7 +130,7 @@ export function resolveKeepaliveChunk({ protocol = 'anthropic.messages', userAge
 }
 
 /**
- * @param {{ intervalMs?: number, userAgent?: string, protocol?: string, write: (chunk: string) => void }} opts
+ * @param {{ intervalMs?: number, userAgent?: string, protocol?: string, write: (chunk: string) => void | boolean }} opts
  */
 export function createDownstreamKeepalive({
   intervalMs = DEFAULT_STREAM_KEEPALIVE_MS,
@@ -153,8 +153,8 @@ export function createDownstreamKeepalive({
     if (Date.now() - lastWriteAt < interval) return
     if (typeof write !== 'function') return
     try {
-      write(resolveKeepaliveChunk({ protocol, userAgent, state }))
-      markWrite()
+      const written = write(resolveKeepaliveChunk({ protocol, userAgent, state }))
+      if (written !== false) markWrite()
     } catch {
       stop()
     }
@@ -181,9 +181,13 @@ export function createDownstreamKeepalive({
     start()
   }
 
-  const observeLine = (line) => {
+  const observeActivity = () => {
     armed = true
     markWrite()
+  }
+
+  const observeLine = (line) => {
+    observeActivity()
     const event = parseSseDataLine(line)
     if (event) {
       state = observeKeepaliveEvent(state, event)
@@ -191,5 +195,5 @@ export function createDownstreamKeepalive({
     }
   }
 
-  return { start, stop, arm, observeLine, beat, getState: () => ({ ...state, armed, lastWriteAt }) }
+  return { start, stop, arm, observeActivity, observeLine, beat, getState: () => ({ ...state, armed, lastWriteAt }) }
 }

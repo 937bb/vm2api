@@ -1,0 +1,8 @@
+FROM vm2api-local:v1.3.148-hotfix-503-v19
+
+COPY src/server.mjs /opt/vm2api/src/server.mjs
+COPY src/lib/pool/openai-account-runtime.mjs /opt/vm2api/src/lib/pool/openai-account-runtime.mjs
+COPY src/lib/pool/codex-slot-pool.mjs /opt/vm2api/src/lib/pool/codex-slot-pool.mjs
+COPY src/lib/protocol/handle-codex.mjs /opt/vm2api/src/lib/protocol/handle-codex.mjs
+COPY src/lib/transport/codex-kernel-supervisor.mjs /opt/vm2api/src/lib/transport/codex-kernel-supervisor.mjs
+COPY src/lib/transport/go-worker-client.mjs /opt/vm2api/src/lib/transport/go-worker-client.mjs
