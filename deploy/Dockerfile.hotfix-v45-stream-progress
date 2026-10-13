@@ -1,0 +1,10 @@
+FROM vm2api-local:v1.3.153-hotfix-v44-kernel-cooldown-rpm
+LABEL org.opencontainers.image.version="1.3.153-hotfix-v45-stream-progress"
+
+COPY src/lib/transport/go-worker-client.mjs /opt/vm2api/src/lib/transport/go-worker-client.mjs
+COPY src/lib/protocol/codex-convert.mjs /opt/vm2api/src/lib/protocol/codex-convert.mjs
+COPY src/lib/protocol/handle-codex.mjs /opt/vm2api/src/lib/protocol/handle-codex.mjs
+COPY src/lib/admin/request-log.mjs /opt/vm2api/src/lib/admin/request-log.mjs
+
+RUN printf '%s\n' '1.3.153-hotfix-v45-stream-progress' > /opt/vm2api/VERSION
+ENV VM2API_BUILD=1.3.153-hotfix-v45-stream-progress

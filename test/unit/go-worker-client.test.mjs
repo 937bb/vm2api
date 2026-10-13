@@ -11,6 +11,7 @@ import {
   workerHealth,
   usageFromSseEvent,
   isDownstreamCommitEvent,
+  isStreamBusinessProgressEvent,
   isUpstreamAcceptedEvent,
   restoreUncommittedHop,
   semanticStatusForStreamError,
@@ -455,7 +456,11 @@ unixTest('kernel metadata keeps the first-event deadline until OpenAI accepts th
 })
 
 unixTest('idle timeout starts after a real upstream lifecycle event', async () => {
-  const fx = await fixture(async (_req, res) => {
+  const fx = await fixture(async (req, res) => {
+    if (req.url === '/internal/v1/cancel') {
+      res.end('{"ok":true}')
+      return
+    }
     res.setHeader('content-type', 'text/event-stream')
     writeData(res, { type: 'response.created', response: { id: 'resp_idle' } })
     await new Promise((resolve) => setTimeout(resolve, 1200))
@@ -474,6 +479,105 @@ unixTest('idle timeout starts after a real upstream lifecycle event', async () =
     assert.equal(result.transportError, true)
     assert.equal(result.body.error.code, 'worker_timeout')
     assert.match(result.body.error.message, /idle timeout after 100ms/)
+  } finally {
+    await fx.close()
+  }
+})
+
+unixTest('control frames do not keep a stalled Responses stream alive', async () => {
+  const fx = await fixture(async (req, res) => {
+    if (req.url === '/internal/v1/cancel') {
+      res.end('{"ok":true}')
+      return
+    }
+    res.setHeader('content-type', 'text/event-stream')
+    writeData(res, { type: 'response.created', response: { id: 'resp_control_only' } })
+    const ticker = setInterval(() => {
+      writeData(res, { type: 'responsesapi.websocket_timing', elapsed_ms: 10 })
+      writeData(res, { type: 'response_headers', headers: { 'x-request-id': 'same' } })
+    }, 30)
+    res.once('close', () => clearInterval(ticker))
+    await new Promise((resolve) => setTimeout(resolve, 1200))
+    res.end()
+  })
+  try {
+    const startedAt = Date.now()
+    const result = await streamGoWorker({
+      exec: fx.exec,
+      body: { model: 'gpt-5.5', stream: true, input: [] },
+      timeoutMs: 500,
+      idleTimeoutMs: 100,
+      overallTimeoutMs: 2000,
+      sseEventMode: 'responses-passthrough',
+      onEvent: () => {},
+    })
+    assert.equal(result.body.error.code, 'worker_timeout')
+    assert.equal(result.kernelStream.termination, 'idle_timeout')
+    assert.equal(result.kernelStream.event_types['responsesapi.websocket_timing'] > 0, true)
+    assert.equal(result.kernelStream.first_business_progress_ms, result.kernelStream.last_business_progress_ms)
+    assert.ok(Date.now() - startedAt < 1000)
+  } finally {
+    await fx.close()
+  }
+})
+
+unixTest('output deltas refresh the Responses business idle deadline', async () => {
+  const fx = await fixture(async (_req, res) => {
+    res.setHeader('content-type', 'text/event-stream')
+    writeData(res, { type: 'response.created', response: { id: 'resp_progress' } })
+    for (let i = 0; i < 3; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 60))
+      writeData(res, { type: 'response.output_text.delta', delta: String(i) })
+    }
+    writeData(res, { type: 'response.completed', response: { id: 'resp_progress', usage: { output_tokens: 3 } } })
+    res.end()
+  })
+  try {
+    const result = await streamGoWorker({
+      exec: fx.exec,
+      body: { model: 'gpt-5.5', stream: true, input: [] },
+      timeoutMs: 500,
+      idleTimeoutMs: 100,
+      overallTimeoutMs: 2000,
+      sseEventMode: 'responses-passthrough',
+      onEvent: () => {},
+    })
+    assert.equal(result.ok, true)
+    assert.equal(result.kernelStream.termination, 'verified')
+    assert.equal(result.kernelStream.event_types['response.output_text.delta'], 3)
+    assert.ok(result.kernelStream.last_business_progress_ms >= 150)
+  } finally {
+    await fx.close()
+  }
+})
+
+unixTest('kernel stream diagnostics contain shape and timing but no request content', async () => {
+  const secret = 'never-log-this-prompt'
+  const fx = await fixture((_req, res) => {
+    res.setHeader('content-type', 'text/event-stream')
+    writeData(res, { type: 'response.created', response: { id: 'resp_diag' } })
+    writeData(res, { type: 'response.output_text.delta', delta: 'never-log-this-output' })
+    writeData(res, { type: 'response.completed', response: { id: 'resp_diag', usage: { output_tokens: 1 } } })
+    res.end()
+  })
+  try {
+    const result = await streamGoWorker({
+      exec: fx.exec,
+      body: {
+        model: 'gpt-5.5',
+        stream: true,
+        input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: secret }] }],
+        tools: [{ type: 'function', name: 'lookup', parameters: { type: 'object' } }],
+      },
+      sseEventMode: 'responses-passthrough',
+      onEvent: () => {},
+    })
+    assert.equal(result.kernelStream.input_items, 1)
+    assert.equal(result.kernelStream.tool_count, 1)
+    assert.ok(result.kernelStream.request_body_bytes > 0)
+    const encoded = JSON.stringify(result.kernelStream)
+    assert.equal(encoded.includes(secret), false)
+    assert.equal(encoded.includes('never-log-this-output'), false)
   } finally {
     await fx.close()
   }
@@ -1179,6 +1283,28 @@ test('only a real upstream lifecycle frame accepts a streamed request', () => {
   assert.equal(isUpstreamAcceptedEvent({ type: 'response.created', response: { id: 'resp_1' } }), true)
   assert.equal(isDownstreamCommitEvent({ type: 'response.created', response: { id: 'resp_1' } }), false)
   assert.equal(isUpstreamAcceptedEvent({ type: 'message_start', message: {} }), false)
+})
+
+test('only model and tool events count as stream business progress', () => {
+  for (const type of [
+    'response.created',
+    'response.in_progress',
+    'response_headers',
+    'response.rate_limits.updated',
+    'responsesapi.websocket_timing',
+    'ping',
+  ]) {
+    assert.equal(isStreamBusinessProgressEvent({ type }), false, type)
+  }
+  for (const event of [
+    { type: 'response.output_text.delta', delta: 'x' },
+    { type: 'response.reasoning_summary_text.delta', delta: 'thinking' },
+    { type: 'response.function_call_arguments.delta', delta: '{}' },
+    { type: 'response.output_item.added', item: { type: 'function_call', name: 'Read' } },
+    { type: 'response.completed' },
+  ]) {
+    assert.equal(isStreamBusinessProgressEvent(event), true, event.type)
+  }
 })
 
 unixTest('streamGoWorker keeps response.created uncommitted when the next event is a server error', async () => {

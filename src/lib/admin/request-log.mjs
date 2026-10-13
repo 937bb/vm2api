@@ -622,6 +622,7 @@ export class RequestLogStore {
         outbound_summary: extra.outbound_summary || null,
         cache_prefix: extra.cache_prefix || null,
         cache_continuity: extra.cache_continuity || null,
+        kernel_stream: extra.kernel_stream || null,
         classifier: extra.classifier || null,
         outbound_headers:
           ctx.capture_outbound && extra.outbound_headers != null ? redactHeaders(extra.outbound_headers) : null,

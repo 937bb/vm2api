@@ -1227,6 +1227,60 @@ test('generic upstream overload is returned without cross-account replay', async
   fs.rmSync(root, { recursive: true, force: true })
 })
 
+test('kernel stream diagnostics reach the request log without cross-account replay', async () => {
+  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  rt.resetOpenAIAccountRuntime()
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-stream-diag-'))
+  writeGptVm(root, 'vm-gpt-a')
+  writeGptVm(root, 'vm-gpt-b')
+  const logBag = {}
+  const diagnostic = {
+    request_body_bytes: 512,
+    input_items: 1,
+    tool_count: 0,
+    event_types: { 'response.created': 1, 'responsesapi.websocket_timing': 9 },
+    termination: 'idle_timeout',
+  }
+  let hops = 0
+  let warning = ''
+  const originalWarn = console.warn
+  console.warn = (...args) => {
+    warning += args.join(' ')
+  }
+  try {
+    const out = await handleCodexProtocol(
+      codexArgs(
+        root,
+        {
+          ensureCodexKernel: async () => ({ ok: true }),
+          streamCodexKernel: async () => {
+            hops += 1
+            return {
+              ok: false,
+              status: 0,
+              committed: false,
+              transportError: true,
+              terminalState: 'transport_error',
+              body: { error: { code: 'worker_timeout', message: 'idle timeout' } },
+              kernelStream: diagnostic,
+            }
+          },
+        },
+        { logBag, requestId: 'req_stream_diag' },
+      ),
+    )
+    assert.equal(out.status, 502)
+    assert.equal(hops, 1)
+    assert.deepEqual(logBag.kernel_stream, diagnostic)
+    assert.match(warning, /\[codex-stream-diagnostic\]/)
+    assert.match(warning, /"termination":"idle_timeout"/)
+  } finally {
+    console.warn = originalWarn
+    rt.resetOpenAIAccountRuntime()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('a committed Responses failure emits a terminal SSE error instead of a silent EOF', async () => {
   const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
   rt.resetOpenAIAccountRuntime()

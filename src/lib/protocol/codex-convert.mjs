@@ -251,6 +251,7 @@ export function normalizeCodexReasoningEffort(raw) {
 
 function stripUnsupportedCodexFields(body = {}) {
   const next = { ...body }
+  next.store = false
   // Official Codex wire uses `priority`. Public API alias `fast` is rejected upstream.
   if (typeof next.service_tier === 'string' && next.service_tier.trim().toLowerCase() === 'fast') {
     next.service_tier = 'priority'

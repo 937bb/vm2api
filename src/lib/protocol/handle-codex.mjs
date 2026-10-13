@@ -1174,6 +1174,21 @@ export async function handleCodexProtocol({
           result.terminalState = 'incomplete'
           result.body = { error: conversionError }
         }
+        const hopLatencyMs = Date.now() - attemptStartedAt
+        if (result?.terminalState !== 'verified' || hopLatencyMs >= 120_000) {
+          if (result?.kernelStream) {
+            logBag.kernel_stream = result.kernelStream
+            console.warn(
+              `[codex-stream-diagnostic] ${JSON.stringify({
+                request_id: requestId || null,
+                vm_id: vm.id,
+                model: converted.body?.model || null,
+                latency_ms: hopLatencyMs,
+                ...result.kernelStream,
+              })}`,
+            )
+          }
+        }
         ingestCodexHop(projectRoot, vm.id, result, Date.now(), normalizeCodexRouting(routing.codex).quota)
         if (result?.transport_retried) {
           attempts += 1
@@ -1229,7 +1244,7 @@ export async function handleCodexProtocol({
             terminalState: delivered ? 'verified' : result?.terminalState || 'error',
             usage,
             ttftMs: result?.ttftMs ?? null,
-            latencyMs: Date.now() - attemptStartedAt,
+            latencyMs: hopLatencyMs,
           })
         } catch {}
         // Responses SSE is not a Claude assistant message, so the stream client

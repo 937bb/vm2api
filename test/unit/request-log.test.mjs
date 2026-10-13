@@ -624,6 +624,20 @@ test('debug mode stores full redacted body', () => {
   assert.deepEqual(dbg[0].hop_meta.params.dropped, ['max_tokens'])
 })
 
+test('debug mode stores content-free kernel stream diagnostics', () => {
+  const store = tmpStore('debug')
+  const ctx = store.start({ method: 'POST', headers: {}, socket: {} }, { pathName: '/v1/responses' })
+  const kernelStream = {
+    request_body_bytes: 1234,
+    input_items: 2,
+    tool_count: 1,
+    event_types: { 'response.created': 1, 'response.output_text.delta': 3 },
+    termination: 'idle_timeout',
+  }
+  store.finish(ctx, { status: 504, kernel_stream: kernelStream })
+  assert.deepEqual(store.getDebug(ctx.request_id).kernel_stream, kernelStream)
+})
+
 test('outbound bodies are stored only when the operator configured debug, not via caller headers', () => {
   const outbound = { body: { system: 'gateway persona overlay' }, headers: { 'x-app': 'cli' } }
   const record = (store, headers) => {

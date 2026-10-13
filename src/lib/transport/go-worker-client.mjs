@@ -84,7 +84,16 @@ function readInternalToken(exec) {
 
 function workerRequest(
   exec,
-  { method = 'GET', requestPath, body = null, signal, timeoutMs = 180000, timeoutMode = 'overall', headers = {} } = {},
+  {
+    method = 'GET',
+    requestPath,
+    body = null,
+    signal,
+    timeoutMs = 180000,
+    timeoutMode = 'overall',
+    headers = {},
+    onPayloadBytes,
+  } = {},
 ) {
   return new Promise((resolve, reject) => {
     const { socketPath } = workerPaths(exec)
@@ -93,6 +102,7 @@ function workerRequest(
       return
     }
     const payload = body == null ? null : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))
+    if (typeof onPayloadBytes === 'function') onPayloadBytes(payload?.length || 0)
     const internalToken = readInternalToken(exec)
     const requestHeaders = { ...headers }
     if (payload) {
@@ -366,6 +376,35 @@ export function isUpstreamAcceptedEvent(event) {
   const type = String(event.type || '')
   if (type === 'error' || type === 'response_headers') return false
   return type === 'response.created' || type === 'response.in_progress' || isDownstreamCommitEvent(event)
+}
+
+/** Frames that prove the model/tool turn advanced, excluding transport/control chatter. */
+export function isStreamBusinessProgressEvent(event) {
+  if (!event || typeof event !== 'object') return false
+  const type = String(event.type || '')
+  if (
+    type === 'error' ||
+    type === 'message_stop' ||
+    type === 'response.completed' ||
+    type === 'response.done' ||
+    type === 'response.failed' ||
+    type === 'response.incomplete'
+  ) {
+    return true
+  }
+  if (type === 'content_block_start' || type === 'content_block_stop' || type === 'message_delta') return true
+  if (type === 'content_block_delta') return isDownstreamCommitEvent(event)
+  if (type.startsWith('response.output_') || type.startsWith('response.content_part.')) return true
+  if (
+    type.startsWith('response.reasoning_') ||
+    type.startsWith('response.function_call_arguments.') ||
+    type.startsWith('response.custom_tool_call_input.')
+  ) {
+    return true
+  }
+  return /^response\.(?:web_search_call|file_search_call|computer_tool_call|code_interpreter_call|mcp_call)\./.test(
+    type,
+  )
 }
 
 /** Anthropic SSE: message_start.message.usage + message_delta.usage. OpenAI Responses: response.usage. */
@@ -747,6 +786,66 @@ export async function streamGoWorker({
   const startedAt = Date.now()
   let ttftMs = null
   const requestId = randomUUID()
+  const outbound = {
+    ...(envelope ||
+      workerEnvelope({
+        body,
+        reqHeaders,
+        exec,
+        identity,
+        stream: true,
+        deliveryMode,
+        want1m,
+        cacheTtl,
+        preserveCacheBreakpoints,
+        cliHop,
+        requestContext,
+      })),
+    request_id: requestId,
+  }
+  const outboundBody = outbound?.body
+  const diagnostic = {
+    request_body_bytes: 0,
+    input_items: Array.isArray(outboundBody?.input)
+      ? outboundBody.input.length
+      : Array.isArray(outboundBody?.messages)
+        ? outboundBody.messages.length
+        : outboundBody?.input == null
+          ? 0
+          : 1,
+    tool_count: Array.isArray(outboundBody?.tools) ? outboundBody.tools.length : 0,
+    requested_transport: typeof outbound?.transport === 'string' ? outbound.transport : null,
+    chunk_count: 0,
+    bytes_read: 0,
+    event_count: 0,
+    event_types: Object.create(null),
+    parse_errors: 0,
+    first_event: null,
+    last_event: null,
+    first_event_ms: null,
+    last_event_ms: null,
+    accepted_ms: null,
+    first_business_progress_ms: null,
+    last_business_progress_ms: null,
+  }
+  let lastBusinessProgressAt = startedAt
+  const markBusinessProgress = (now = Date.now()) => {
+    const elapsed = Math.max(0, now - startedAt)
+    if (diagnostic.first_business_progress_ms == null) diagnostic.first_business_progress_ms = elapsed
+    diagnostic.last_business_progress_ms = elapsed
+    lastBusinessProgressAt = now
+  }
+  const streamDiagnostic = (terminalState, termination, extra = {}) => ({
+    ...diagnostic,
+    event_types: { ...diagnostic.event_types },
+    elapsed_ms: Math.max(0, Date.now() - startedAt),
+    idle_for_ms: Math.max(0, Date.now() - lastBusinessProgressAt),
+    terminal_state: terminalState,
+    termination,
+    ...extra,
+  })
+  let upstreamAccepted = false
+  let watchdogExpired = false
   const overallMs = Math.max(0, Number(overallTimeoutMs) || 0)
   const deadlineController = overallMs > 0 ? new AbortController() : null
   const workerSignal = deadlineController
@@ -769,27 +868,14 @@ export async function streamGoWorker({
     const response = await workerRequest(exec, {
       method: 'POST',
       requestPath,
-      body: {
-        ...(envelope ||
-          workerEnvelope({
-            body,
-            reqHeaders,
-            exec,
-            identity,
-            stream: true,
-            deliveryMode,
-            want1m,
-            cacheTtl,
-            preserveCacheBreakpoints,
-            cliHop,
-            requestContext,
-          })),
-        request_id: requestId,
-      },
+      body: outbound,
       signal: workerSignal,
       timeoutMs,
       timeoutMode: 'first-byte',
       headers: { te: 'trailers' },
+      onPayloadBytes: (bytes) => {
+        diagnostic.request_body_bytes = bytes
+      },
     })
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
     if (typeof onResponse === 'function') {
@@ -797,6 +883,7 @@ export async function streamGoWorker({
     }
     if ((response.statusCode || 0) < 200 || (response.statusCode || 0) >= 300) {
       const data = await readAll(response, 1024 * 1024)
+      const terminalState = headers['x-terminal-state'] || 'error'
       return restoreKernelErrorStatus({
         ok: false,
         status: response.statusCode || 0,
@@ -804,8 +891,11 @@ export async function streamGoWorker({
         body: parseJson(data),
         headers,
         committed: false,
-        terminalState: headers['x-terminal-state'] || 'error',
+        terminalState,
         transportError: false,
+        kernelStream: streamDiagnostic(terminalState, 'http_error', {
+          response_status: response.statusCode || 0,
+        }),
       })
     }
     let buffer = ''
@@ -815,7 +905,6 @@ export async function streamGoWorker({
     let sseModel = null
     let sseStop = null
     let sseRateHeaders = {}
-    let upstreamAccepted = false
     const responsesPassthrough = sseEventMode === 'responses-passthrough'
     const assembler = responsesPassthrough ? null : createClaudeMessageAssembler()
     const batchEvents = responsesPassthrough && typeof onEventBatch === 'function'
@@ -862,7 +951,18 @@ export async function streamGoWorker({
     }
     const observeSseEvent = (event) => {
       if (!event) return event
-      if (ttftMs == null && isFirstTokenEvent(event)) ttftMs = Date.now() - startedAt
+      const now = Date.now()
+      const type = String(event.type || 'unknown').slice(0, 120) || 'unknown'
+      const elapsed = Math.max(0, now - startedAt)
+      diagnostic.event_count += 1
+      diagnostic.event_types[type] = (diagnostic.event_types[type] || 0) + 1
+      if (diagnostic.first_event == null) {
+        diagnostic.first_event = type
+        diagnostic.first_event_ms = elapsed
+      }
+      diagnostic.last_event = type
+      diagnostic.last_event_ms = elapsed
+      if (ttftMs == null && isFirstTokenEvent(event)) ttftMs = elapsed
       if (event.type === 'response_headers' && event.headers && typeof event.headers === 'object') {
         sseRateHeaders = { ...sseRateHeaders, ...event.headers }
       }
@@ -870,9 +970,14 @@ export async function streamGoWorker({
       if (event.type === 'message_stop') sawMessageStop = true
       if (event.type === 'response.completed' || event.type === 'response.done') sawResponseTerminal = true
       if (isUpstreamAcceptedEvent(event)) {
-        upstreamAccepted = true
+        if (!upstreamAccepted) {
+          upstreamAccepted = true
+          diagnostic.accepted_ms = elapsed
+          markBusinessProgress(now)
+        }
         if (typeof onAccepted === 'function') onAccepted(event)
       }
+      if (isStreamBusinessProgressEvent(event)) markBusinessProgress(now)
       const evUsage = usageFromSseEvent(event)
       if (evUsage) sseUsage = mergeUsage(sseUsage, evUsage)
       if (event.message?.model) sseModel = event.message.model
@@ -882,24 +987,28 @@ export async function streamGoWorker({
     }
     const firstByteMs = Math.max(0, Number(timeoutMs) || 0)
     const idleMs = Math.max(0, Number(idleTimeoutMs) || 0)
-    let lastChunkAt = Date.now()
     let sawMessageStop = false
     let sawResponseTerminal = false
     let idleTimer = null
     if (firstByteMs > 0 || idleMs > 0) {
+      const limits = [firstByteMs, idleMs].filter((value) => value > 0)
+      const checkEveryMs = Math.min(1000, Math.max(25, Math.floor(Math.min(...limits) / 4)))
       idleTimer = setInterval(() => {
         // Kernel metadata (rate limits / response headers) proves the local
         // socket is alive, but it does not mean OpenAI accepted the turn. Keep
         // the longer first-event deadline until a real lifecycle frame arrives.
         const limit = upstreamAccepted ? idleMs : firstByteMs
         if (limit <= 0) return
-        const activeAt = upstreamAccepted ? lastChunkAt : startedAt
+        const activeAt = upstreamAccepted ? lastBusinessProgressAt : startedAt
         if (Date.now() - activeAt < limit) return
+        if (watchdogExpired) return
+        watchdogExpired = true
         const which = upstreamAccepted ? 'idle' : 'first-event'
+        requestKernelCancel(exec, requestId)
         response.destroy(
           Object.assign(new Error(`slot worker ${which} timeout after ${limit}ms`), { code: 'worker_timeout' }),
         )
-      }, 1000)
+      }, checkEveryMs)
       idleTimer.unref?.()
     }
     try {
@@ -908,8 +1017,10 @@ export async function streamGoWorker({
       // closes the response so a normal completion is not mistaken for cancel.
       for await (const chunk of response) {
         const eventBatch = batchEvents ? [] : null
-        lastChunkAt = Date.now()
-        buffer += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)
+        const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk))
+        diagnostic.chunk_count += 1
+        diagnostic.bytes_read += value.length
+        buffer += value.toString('utf8')
         let newline
         while ((newline = buffer.indexOf('\n')) >= 0) {
           const line = buffer.slice(0, newline).replace(/\r$/, '')
@@ -921,6 +1032,7 @@ export async function streamGoWorker({
             if (piece && piece !== '[DONE]') {
               dataBuf = dataBuf ? `${dataBuf}\n${piece}` : piece
               parsedEvent = observeSseEvent(takeSseEvent())
+              if (!parsedEvent) diagnostic.parse_errors += 1
               if (isDownstreamCommitEvent(parsedEvent)) {
                 const delivery = flushCommit(eventBatch)
                 if (delivery) await delivery
@@ -931,6 +1043,7 @@ export async function streamGoWorker({
               const event = takeSseEvent()
               dataBuf = ''
               observeSseEvent(event)
+              if (!event) diagnostic.parse_errors += 1
               if (isDownstreamCommitEvent(event)) {
                 const delivery = flushCommit(eventBatch)
                 if (delivery) await delivery
@@ -939,6 +1052,7 @@ export async function streamGoWorker({
           } else if (dataBuf && !line.startsWith('event:') && !line.startsWith(':')) {
             dataBuf = `${dataBuf}\n${line}`
             const event = observeSseEvent(takeSseEvent())
+            if (!event) diagnostic.parse_errors += 1
             if (isDownstreamCommitEvent(event)) {
               const delivery = flushCommit(eventBatch)
               if (delivery) await delivery
@@ -957,6 +1071,7 @@ export async function streamGoWorker({
       }
       if (dataBuf) {
         const event = observeSseEvent(takeSseEvent())
+        if (!event) diagnostic.parse_errors += 1
         if (isDownstreamCommitEvent(event)) {
           const delivery = flushCommit(finalBatch)
           if (delivery) await delivery
@@ -976,6 +1091,7 @@ export async function streamGoWorker({
       if (finalBatch?.length) await dispatchEntries(finalBatch)
       const terminalState = complete ? 'verified' : 'incomplete'
       const rateHeaders = mergeRateLimitHeaders({ ...sseRateHeaders, ...headers, ...trailers })
+      const termination = complete ? 'verified' : lastError ? 'error_event' : 'eof_incomplete'
       return restoreUncommittedHop({
         ok: response.statusCode === 200 && !lastError && complete,
         status: response.statusCode || 0,
@@ -997,18 +1113,24 @@ export async function streamGoWorker({
         committed,
         terminalState,
         transportError: false,
+        kernelStream: streamDiagnostic(terminalState, termination, {
+          response_status: response.statusCode || 0,
+        }),
       })
     } finally {
       if (idleTimer) clearInterval(idleTimer)
     }
   } catch (error) {
     if (signal?.aborted) {
-      return clientCancelledResult({
-        via: 'go-worker-stream',
-        ttftMs,
-        firstTokenAt: ttftMs == null ? null : startedAt + ttftMs,
-        committed,
-      })
+      return {
+        ...clientCancelledResult({
+          via: 'go-worker-stream',
+          ttftMs,
+          firstTokenAt: ttftMs == null ? null : startedAt + ttftMs,
+          committed,
+        }),
+        kernelStream: streamDiagnostic(committed ? 'incomplete' : 'cancelled', 'client_cancelled'),
+      }
     }
     if (deadlineExpired) {
       return {
@@ -1029,8 +1151,12 @@ export async function streamGoWorker({
         committed,
         terminalState: committed ? 'incomplete' : 'transport_error',
         transportError: true,
+        kernelStream: streamDiagnostic(committed ? 'incomplete' : 'transport_error', 'overall_timeout', {
+          timeout_ms: overallMs,
+        }),
       }
     }
+    if (error.code === 'worker_timeout' && !watchdogExpired) requestKernelCancel(exec, requestId)
     return {
       ok: false,
       status: 0,
@@ -1049,6 +1175,15 @@ export async function streamGoWorker({
       committed,
       terminalState: committed ? 'incomplete' : 'transport_error',
       transportError: true,
+      kernelStream: streamDiagnostic(
+        committed ? 'incomplete' : 'transport_error',
+        error.code === 'worker_timeout'
+          ? upstreamAccepted
+            ? 'idle_timeout'
+            : 'first_event_timeout'
+          : 'transport_error',
+        error.code === 'worker_timeout' ? { timeout_ms: upstreamAccepted ? idleTimeoutMs : timeoutMs } : {},
+      ),
     }
   } finally {
     if (deadlineTimer) clearTimeout(deadlineTimer)

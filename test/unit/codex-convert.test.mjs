@@ -123,6 +123,15 @@ test('native responses system role becomes developer', () => {
   assert.equal(converted.body.prompt_cache_retention, undefined)
 })
 
+test('native responses always disables server-side storage', () => {
+  const converted = toCodexResponses('openai.responses', {
+    model: 'gpt-5.5',
+    input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] }],
+    store: true,
+  })
+  assert.equal(converted.body.store, false)
+})
+
 test('native responses string input becomes Codex list', () => {
   const converted = toCodexResponses('openai.responses', {
     model: 'gpt-5.5',
