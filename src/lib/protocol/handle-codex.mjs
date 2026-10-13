@@ -229,6 +229,7 @@ export function pickCodexCandidates(
     routing = {},
     stickyKeys: preparedStickyKeys = null,
     responseKey: preparedResponseKey = null,
+    capacityRetryVmId = null,
   } = {},
 ) {
   const pin = pinnedVmId(req)
@@ -284,24 +285,28 @@ export function pickCodexCandidates(
   }
   const bound = continuesResponse ? responseBound : sessionBound
   const scopedVms = vms.filter((vm) => keyAllowsVm(scope, vm))
+  const retryVmId = isValidVmId(capacityRetryVmId) ? capacityRetryVmId : null
   if (continuesResponse && !bound?.vmId) {
     return { error: 'response_not_portable', ids: [], sessionKey, stickyKeys, responseKey }
   }
   if (scope.vm_pool_id && scopedVms.length === 0 && !continuesResponse) {
     return { error: 'vm_pool_unavailable', message: '账号池没有可调度的 GPT 槽位', ids: [], candidates: [] }
   }
-  const ordered = orderCodexSessionSlots(
-    continuesResponse ? scopedVms.filter((vm) => vm.id === bound.vmId) : scopedVms,
-    {
-      boundVmId: bound?.vmId || null,
-      sessionKey,
-      sessionLimit: sessions,
-      model,
-      excluded,
-      quotaPolicy: routingPolicy,
-      snapshotCache: inventory.snapshotCache,
-    },
-  )
+  const candidateVms = continuesResponse
+    ? scopedVms.filter((vm) => vm.id === bound.vmId)
+    : retryVmId
+      ? scopedVms.filter((vm) => vm.id === retryVmId)
+      : scopedVms
+  const ordered = orderCodexSessionSlots(candidateVms, {
+    pin: retryVmId,
+    boundVmId: bound?.vmId || null,
+    sessionKey,
+    sessionLimit: sessions,
+    model,
+    excluded,
+    quotaPolicy: routingPolicy,
+    snapshotCache: inventory.snapshotCache,
+  })
   if (bound?.vmId && sessionKey && ordered.boundState === 'gone') {
     for (const key of stickyKeys.length ? stickyKeys : [sessionKey]) stickyRouter?.unbind?.(key)
     try {
@@ -311,7 +316,17 @@ export function pickCodexCandidates(
   if (continuesResponse && (ordered.boundState === 'gone' || ordered.error === 'candidates_exhausted')) {
     return { error: 'response_not_portable', ids: [], sessionKey, stickyKeys, responseKey, boundVmId: bound.vmId }
   }
-  return { ...ordered, sessionKey, stickyKeys, responseKey, routeBound: bound }
+  const retryOwnsPin = !!retryVmId && bound?.vmId === retryVmId
+  return {
+    ...ordered,
+    sticky: retryOwnsPin || ordered.sticky,
+    boundState: retryOwnsPin ? 'live' : ordered.boundState,
+    home: retryOwnsPin ? retryVmId : ordered.home,
+    sessionKey,
+    stickyKeys,
+    responseKey,
+    routeBound: bound,
+  }
 }
 
 function ingestCodexHop(projectRoot, vmId, result, now = Date.now(), policy = null) {
@@ -1263,9 +1278,15 @@ export async function handleCodexProtocol({
         }
         if (isCodexFailoverError(result)) {
           // no_capacity is a transient admission mismatch: park it in the
-          // runtime gate and let this request wait/retry within its budget.
-          if (errorCode !== 'no_capacity') pickOpts.excluded.add(vm.id)
-          leaveSticky()
+          // runtime gate and let a pinned conversation wait on its home slot.
+          // New conversations may still spill because they have no warm cache.
+          if (errorCode === 'no_capacity') {
+            if (ownsPin) pickOpts.capacityRetryVmId = vm.id
+          } else {
+            pickOpts.capacityRetryVmId = null
+            pickOpts.excluded.add(vm.id)
+            leaveSticky()
+          }
           continue
         }
         break

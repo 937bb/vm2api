@@ -982,6 +982,69 @@ test('kernel no_capacity is absorbed by bounded admission retry and records a ca
   }
 })
 
+test('sticky kernel no_capacity waits on its home account without dropping cache affinity', async () => {
+  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  rt.resetOpenAIAccountRuntime()
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-sticky-capacity-'))
+  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  writeGptVm(root, 'vm-gpt-a')
+  writeGptVm(root, 'vm-gpt-b')
+  const headers = { 'x-session-id': 'sess-sticky-capacity' }
+  const body = { model: 'gpt-5.5', input: 'warm this conversation', stream: false }
+  let homeVmId = null
+  let warmSessionId = null
+  const attempts = []
+  const keepAlive = setTimeout(() => {}, 5000)
+  try {
+    const warm = await hopCodex({
+      root,
+      stickyRouter: sticky,
+      headers,
+      body,
+      onHop: async ({ exec, envelope }) => {
+        homeVmId = exec.vmId
+        warmSessionId = envelope.session.session_id
+        return { ok: true, status: 200, terminalState: 'verified', body: { id: 'resp_warm' } }
+      },
+    })
+    assert.equal(warm.res.statusCode, 200)
+
+    const retried = await hopCodex({
+      root,
+      stickyRouter: sticky,
+      headers,
+      body: { ...body, input: 'continue this conversation' },
+      onHop: async ({ exec, envelope }) => {
+        attempts.push({ vmId: exec.vmId, sessionId: envelope.session.session_id })
+        if (attempts.length === 1) {
+          return {
+            ok: false,
+            status: 503,
+            committed: false,
+            body: { error: { code: 'no_capacity', message: 'credential busy' } },
+          }
+        }
+        return { ok: true, status: 200, terminalState: 'verified', body: { id: 'resp_retry' } }
+      },
+    })
+
+    assert.equal(retried.res.statusCode, 200)
+    assert.deepEqual(
+      attempts.map((attempt) => attempt.vmId),
+      [homeVmId, homeVmId],
+    )
+    assert.deepEqual(
+      attempts.map((attempt) => attempt.sessionId),
+      [warmSessionId, warmSessionId],
+    )
+  } finally {
+    clearTimeout(keepAlive)
+    rt.resetOpenAIAccountRuntime()
+    sticky.db?.close?.()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('persistent kernel no_capacity expires as local pool backpressure, not an upstream 503', async () => {
   const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
   rt.resetOpenAIAccountRuntime()
