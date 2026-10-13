@@ -914,6 +914,78 @@ test('#A04: the fifth GPT slot is reached after four slots fail over', async () 
   fs.rmSync(root, { recursive: true, force: true })
 })
 
+test('upstream 403 mirrors the kernel cooldown before failing over', async () => {
+  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  rt.resetOpenAIAccountRuntime()
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-kernel-cooldown-'))
+  writeGptVm(root, 'vm-gpt-a')
+  writeGptVm(root, 'vm-gpt-b')
+  const seen = []
+  try {
+    const out = await handleCodexProtocol(
+      codexArgs(root, {
+        ensureCodexKernel: async () => ({ ok: true }),
+        streamCodexKernel: async ({ exec, onEvent }) => {
+          seen.push(exec.vm.id)
+          if (seen.length === 1) {
+            return {
+              ok: false,
+              status: 403,
+              committed: false,
+              body: { error: { code: 'upstream_auth', message: 'forbidden' } },
+            }
+          }
+          await onEvent('data: {"type":"response.completed"}')
+          return { ok: true, status: 200, terminalState: 'verified' }
+        },
+      }),
+    )
+    assert.equal(out.status, 200)
+    assert.equal(seen.length, 2)
+    assert.notEqual(seen[0], seen[1])
+    const blocked = rt.openAIRuntimeSignals(seen[0])
+    assert.ok(blocked.kernelCooldownUntil > Date.now())
+    assert.equal(rt.tryAcquireOpenAISlot(seen[0], { concurrency: 40 }), null)
+  } finally {
+    rt.resetOpenAIAccountRuntime()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('request-scoped content policy 403 does not cool down the account', async () => {
+  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  rt.resetOpenAIAccountRuntime()
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-policy-403-'))
+  writeGptVm(root, 'vm-gpt-a')
+  writeGptVm(root, 'vm-gpt-b')
+  const seen = []
+  try {
+    const out = await handleCodexProtocol(
+      codexArgs(root, {
+        ensureCodexKernel: async () => ({ ok: true }),
+        streamCodexKernel: async ({ exec, onEvent }) => {
+          seen.push(exec.vm.id)
+          if (seen.length === 1) {
+            return {
+              ok: false,
+              status: 403,
+              committed: false,
+              body: { error: { code: 'cyber_policy', message: 'request denied' } },
+            }
+          }
+          await onEvent('data: {"type":"response.completed"}')
+          return { ok: true, status: 200, terminalState: 'verified' }
+        },
+      }),
+    )
+    assert.equal(out.status, 200)
+    assert.equal(rt.openAIRuntimeSignals(seen[0]).kernelCooldownUntil, null)
+  } finally {
+    rt.resetOpenAIAccountRuntime()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('kernel no_capacity is absorbed by bounded admission retry and records a capacity rejection', async () => {
   const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
   rt.resetOpenAIAccountRuntime()

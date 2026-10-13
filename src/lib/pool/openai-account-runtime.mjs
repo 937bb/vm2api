@@ -75,6 +75,7 @@ function slotOf(id) {
       capacityRejects: 0,
       capacityBlockedUntil: null,
       capacityProbeInFlight: false,
+      kernelCooldownUntil: null,
       recoveryBlocked: false,
       retirementBlocked: false,
     }
@@ -114,12 +115,14 @@ export function openAIRuntimeSignals(id, now = Date.now()) {
   const failure = entry ? decayedFailure(entry, now) : 0
   const latency = entry?.latency
   const rpmCount = recentStarts(slot, now)
+  const capacityBlockedUntil = Math.max(Number(slot?.capacityBlockedUntil) || 0, Number(slot?.kernelCooldownUntil) || 0)
   return {
     inFlight: slot?.inFlight || 0,
     lastStartedAt: slot?.lastStartedAt ?? null,
     rpmCount,
     rpmResetAt: rpmCount ? slot.starts[slot.startsHead] + RPM_WINDOW_MS : null,
-    capacityBlockedUntil: Number(slot?.capacityBlockedUntil) > now ? Number(slot.capacityBlockedUntil) : null,
+    capacityBlockedUntil: capacityBlockedUntil > now ? capacityBlockedUntil : null,
+    kernelCooldownUntil: Number(slot?.kernelCooldownUntil) > now ? Number(slot.kernelCooldownUntil) : null,
     recoveryBlocked: !!(slot?.recoveryBlocked || slot?.retirementBlocked),
     retirementBlocked: !!slot?.retirementBlocked,
     failureRateBps: Math.round(Math.min(1, Math.max(0, failure)) * 10_000),
@@ -160,6 +163,7 @@ export function tryAcquireOpenAISlot(id, { concurrency = 1, maxRpm = 0, now = Da
     slot.recoveryBlocked ||
     slot.retirementBlocked ||
     Number(slot.capacityBlockedUntil) > now ||
+    Number(slot.kernelCooldownUntil) > now ||
     (recoveringCapacity && slot.capacityProbeInFlight)
   )
     return null
@@ -249,6 +253,19 @@ export function markOpenAICapacityRejected(id, now = Date.now()) {
   const delay = Math.min(CAPACITY_REJECT_MAX_MS, CAPACITY_REJECT_BASE_MS * 2 ** (slot.capacityRejects - 1))
   slot.capacityBlockedUntil = Math.max(Number(slot.capacityBlockedUntil) || 0, now + delay)
   return slot.capacityBlockedUntil
+}
+
+/**
+ * Mirror a cooldown already entered by the bundled kernel. Unlike the short
+ * no_capacity probe backoff, this deadline must survive completions from jobs
+ * that started before the upstream rejection which opened the cooldown.
+ */
+export function markOpenAIKernelCooldown(id, until) {
+  const slot = slotOf(id)
+  const deadline = Number(until)
+  if (!Number.isFinite(deadline) || deadline <= 0) return null
+  slot.kernelCooldownUntil = Math.max(Number(slot.kernelCooldownUntil) || 0, deadline)
+  return slot.kernelCooldownUntil
 }
 
 export function clearOpenAICapacityRejected(id) {

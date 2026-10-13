@@ -114,7 +114,7 @@
       "limit_5h": 1,
       "limit_7d": 1,
       "max_concurrency": 40,
-      "max_rpm": 0,
+      "max_rpm": 60,
       "max_sessions": 0
     }
   },

@@ -45,13 +45,15 @@ import {
   deferOpenAIWaiter,
   endOpenAIAccountRecovery,
   markOpenAICapacityRejected,
+  markOpenAIKernelCooldown,
   openAIRuntimeSignals,
   reportOpenAIAttempt,
   waitForOpenAIAccountIdle,
   waitForOpenAICapacity,
 } from '../pool/openai-account-runtime.mjs'
 import { globalOpenAILeaseEnabled } from '../pool/openai-global-lease.mjs'
-import { CLIENT_POOL_BUSY_MESSAGE } from '../core/errors.mjs'
+import { CLIENT_POOL_BUSY_MESSAGE, retryAfterSeconds } from '../core/errors.mjs'
+import { isContentPolicyErrorCode } from '../core/refusal-guard.mjs'
 import { streamIdleTimeoutMs } from '../core/config.mjs'
 import { applyOpenaiWashLog } from './openai-wash.mjs'
 import { sessionIdForLog } from './log-fields.mjs'
@@ -170,7 +172,24 @@ function pinnedVmId(req) {
 
 const DEFAULT_CODEX_INVENTORY_CACHE_MS = 250
 const CODEX_INVENTORY_CACHE_LIMIT = 32
+const DEFAULT_CODEX_KERNEL_PERMISSION_COOLDOWN_MS = 30_000
 const codexInventoryCache = new Map()
+
+function headerValue(headers, name) {
+  const target = String(name).toLowerCase()
+  for (const [key, value] of Object.entries(headers || {})) {
+    if (String(key).toLowerCase() === target) return Array.isArray(value) ? value[0] : value
+  }
+  return null
+}
+
+function codexKernelCooldownUntil(result, now = Date.now()) {
+  if (Number(result?.status) !== 403 || result?.committed) return null
+  const code = String(result?.body?.error?.code || result?.error_code || '')
+  if (isContentPolicyErrorCode(code)) return null
+  const retryAfter = retryAfterSeconds(headerValue(result?.headers, 'retry-after'), now)
+  return now + (retryAfter == null ? DEFAULT_CODEX_KERNEL_PERMISSION_COOLDOWN_MS : retryAfter * 1000)
+}
 
 function codexInventoryCacheMs() {
   const configured = Number(process.env.KIN_CODEX_INVENTORY_CACHE_MS)
@@ -1181,6 +1200,8 @@ export async function handleCodexProtocol({
           attemptKind = 'capacity_rejected'
           markOpenAICapacityRejected(vm.id)
         }
+        const kernelCooldownUntil = delivered ? null : codexKernelCooldownUntil(result)
+        if (kernelCooldownUntil != null) markOpenAIKernelCooldown(vm.id, kernelCooldownUntil)
         const runtimeAfterAttempt = openAIRuntimeSignals(vm.id)
         try {
           attemptsRepo?.complete?.(requestId, attemptNo, {

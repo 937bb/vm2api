@@ -314,6 +314,21 @@ test('kernel capacity rejection temporarily blocks admission and reports its ret
   rt.resetOpenAIAccountRuntime()
 })
 
+test('kernel cooldown survives completions from work admitted before the rejection', async () => {
+  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  rt.resetOpenAIAccountRuntime()
+  const now = Date.parse('2026-10-13T00:00:00.000Z')
+  const until = now + 30_000
+  assert.equal(rt.markOpenAIKernelCooldown('vm-a', until), until)
+  rt.reportOpenAIAttempt('vm-a', 'succeeded', 100, now + 1_000)
+  assert.equal(rt.openAIRuntimeSignals('vm-a', now + 1_000).kernelCooldownUntil, until)
+  assert.equal(rt.tryAcquireOpenAISlot('vm-a', { concurrency: 40, now: now + 1_000 }), null)
+  const lease = rt.tryAcquireOpenAISlot('vm-a', { concurrency: 40, now: until })
+  assert.ok(lease)
+  lease.release()
+  rt.resetOpenAIAccountRuntime()
+})
+
 test('account recovery gate blocks new leases without changing configured concurrency', async () => {
   const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
   rt.resetOpenAIAccountRuntime()
